@@ -1,0 +1,17 @@
+# 构建产物
+/build*/
+/cmake-build*/
+
+# 训练数据集（体积大，不应入库）
+/datasets/
+/datasets.zip
+
+# 截图与临时文件
+*.png
+*.jpg
+*.jpeg
+*.bmp
+
+# IDE
+/.idea/
+/.vscode/
