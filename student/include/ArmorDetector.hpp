@@ -17,12 +17,6 @@
 //   5. 裁剪中央区域做数字分类，只有编号 1..5 才判定为有效目标。
 class ArmorDetector {
 public:
-    // 设置分类器；传入 nullptr 可禁用数字分类。
-    void setClassifier(const NumberClassifier* classifier) { classifier_ = classifier; }
-
-    std::vector<ArmorDetection> detect(const cv::Mat& bgr, TeamColor enemy_color) const;
-
-private:
     // 单个灯条候选（沿主轴拟合的线段）。
     struct LightBar {
         cv::Point2f top;       // 顶部端点
@@ -34,6 +28,19 @@ private:
         float fill_ratio{0.0F};// 轮廓面积 / 外接矩形面积
     };
 
+    // 设置分类器；传入 nullptr 可禁用数字分类。
+    void setClassifier(const NumberClassifier* classifier) { classifier_ = classifier; }
+
+    std::vector<ArmorDetection> detect(const cv::Mat& bgr, TeamColor enemy_color) const;
+
+    // 调试：构建掩膜并提取灯条（不配对），供实时可视化反馈灯条级中间结果。
+    std::vector<LightBar> debugExtractBars(const cv::Mat& bgr,
+                                           TeamColor enemy_color) const {
+        const cv::Mat mask = buildMask(bgr, enemy_color);
+        return extractLightBars(mask);
+    }
+
+private:
     cv::Mat buildMask(const cv::Mat& bgr, TeamColor enemy_color) const;
     std::vector<LightBar> extractLightBars(const cv::Mat& mask) const;
     // 从匹配的左右灯条生成角点与目标。返回 true 表示生成有效候选。

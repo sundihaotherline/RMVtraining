@@ -10,7 +10,7 @@ option(BUILD_TESTING "Build the starter-project tests" ON)
 option(ENABLE_MVS_CAMERA "Build with HIKROBOT MVS camera capture support" ON)
 
 find_package(Eigen3 REQUIRED)
-find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc calib3d imgcodecs)
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc calib3d imgcodecs highgui)
 find_package(Threads REQUIRED)
 
 # 海康 MVS 相机 SDK（可选）。找不到时仍可编译，get_pic 退化为离线图片源。

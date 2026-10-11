@@ -19,15 +19,15 @@ constexpr int kRedHueLow2 = 156;
 constexpr int kRedHueHigh2 = 180;
 constexpr int kBlueHueLow = 100;
 constexpr int kBlueHueHigh = 124;
-constexpr int kColorSaturationMin = 40;
+constexpr int kColorSaturationMin = 80;
 constexpr int kColorValueMin = 30;
 // ---- BGR 通道差掩膜阈值 ----
-constexpr int kChannelDiffMin = 25;
+constexpr int kChannelDiffMin = 40;
 
 // ---- 灯条候选过滤 ----
 constexpr double kMinLengthRatio = 0.04;   // 相对图像高度
 constexpr double kMinAspectRatio = 2.0;    // 长度/宽度
-constexpr double kMaxAngleDeg = 30.0;      // 相对竖直方向
+constexpr double kMaxAngleDeg = 45.0;      // 相对竖直方向（真实场景灯条可能倾斜）
 constexpr double kMinFillRatio = 0.4;      // 轮廓面积 / 外接矩形面积
 constexpr double kMinBarArea = 80.0;
 
@@ -36,9 +36,13 @@ constexpr double kMaxLengthRatio = 2.0;    // 长度比
 constexpr double kMaxAngleDiffDeg = 10.0;
 constexpr double kMinPairWidthRatio = 1.2; // 中心距/平均长度
 constexpr double kMaxPairWidthRatio = 6.0;
-constexpr double kMaxVerticalOffsetRatio = 0.5; // 中心纵向偏移/平均长度
+constexpr double kMaxAlongAxisOffsetRatio = 0.5; // 中心沿灯条主轴偏移/平均长度
 // 大小装甲板分界：中心距/灯条长度（小 135/57≈2.37，大 230/57≈4.04）。
 constexpr double kLargeArmorRatio = 3.0;
+
+// 灯条端点外扩比例：掩膜阈值常把灯条顶端/底端截短几像素，
+// 外扩保证装甲板整体（含中央数字）被完整框住。
+constexpr float kBarEndMarginRatio = 0.08F;
 
 // ---- 数字分类 ----
 constexpr float kMinNumberConfidence = 0.5F;
@@ -99,7 +103,9 @@ cv::Mat ArmorDetector::buildMask(const cv::Mat& bgr, TeamColor enemy_color) cons
 
     // 开运算去噪，闭运算填充灯条内部的过曝亮斑造成的空洞。
     cv::Mat kernel_open = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 9));
+    // 竖直细长核：沿灯条方向（竖直）闭运算，桥接灯条内部因过曝/过暗造成的
+    // 竖向断口，同时几乎不横向扩展，避免把左右两根灯条粘成一体。
+    cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 15));
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel_open);
     cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel_close);
     return mask;
@@ -186,7 +192,27 @@ std::vector<ArmorDetector::LightBar> ArmorDetector::extractLightBars(
 
 bool ArmorDetector::buildDetection(const LightBar& left, const LightBar& right,
                                    ArmorDetection& detection) const {
-    detection.corners = {left.top, right.top, right.bottom, left.bottom};
+    // 端点沿灯条主轴向外扩一段，补偿掩膜阈值造成的顶端/底端截短，
+    // 使框覆盖整块装甲板（数字不残缺）。
+    const auto extend = [](const cv::Point2f& tip, const cv::Point2f& toward,
+                           float margin) {
+        const cv::Point2f d = tip - toward;
+        const float len = cv::norm(d);
+        if (len < 1e-3F) {
+            return tip;
+        }
+        return tip + (d / len) * margin;
+    };
+    const cv::Point2f left_top =
+        extend(left.top, left.bottom, kBarEndMarginRatio * left.length);
+    const cv::Point2f left_bottom =
+        extend(left.bottom, left.top, kBarEndMarginRatio * left.length);
+    const cv::Point2f right_top =
+        extend(right.top, right.bottom, kBarEndMarginRatio * right.length);
+    const cv::Point2f right_bottom =
+        extend(right.bottom, right.top, kBarEndMarginRatio * right.length);
+
+    detection.corners = {left_top, right_top, right_bottom, left_bottom};
     orderCornersClockwise(detection.corners);
 
     // 图像边界检查：角点必须在图像内或仅略微越界。
@@ -273,14 +299,29 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
             const double length_ratio =
                 std::max(a.length, b.length) / std::min(a.length, b.length);
             const double angle_diff = std::abs(a.angle_deg - b.angle_deg);
-            const double center_dist = dist(a.center, b.center);
-            const double pair_ratio = center_dist / avg_length;
-            const double vertical_offset =
-                std::abs(a.center.y - b.center.y) / avg_length;
+
+            // 灯条主轴单位向量（top->bottom）。真实场景灯条可能倾斜，
+            // 用“沿轴偏移 / 垂直轴偏移”取代固定竖直方向的比较，保证旋转不变。
+            cv::Point2f axis = a.bottom - a.top;
+            const float axis_len = cv::norm(axis);
+            if (axis_len < 1e-3F) {
+                continue;
+            }
+            axis.x /= axis_len;
+            axis.y /= axis_len;
+            const cv::Point2f center_vec = b.center - a.center;
+            // 沿灯条方向的分量：两灯条应近乎等高（越小越好）。
+            const double along_axis = std::abs(center_vec.x * axis.x +
+                                               center_vec.y * axis.y);
+            // 垂直灯条方向的分量：即装甲板宽度方向的中心距。
+            const double perp_axis = std::abs(center_vec.x * axis.y -
+                                              center_vec.y * axis.x);
+            const double pair_ratio = perp_axis / avg_length;
+            const double along_offset = along_axis / avg_length;
 
             if (length_ratio > kMaxLengthRatio || angle_diff > kMaxAngleDiffDeg ||
                 pair_ratio < kMinPairWidthRatio || pair_ratio > kMaxPairWidthRatio ||
-                vertical_offset > kMaxVerticalOffsetRatio) {
+                along_offset > kMaxAlongAxisOffsetRatio) {
                 continue;
             }
 

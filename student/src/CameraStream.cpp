@@ -93,10 +93,14 @@ bool CameraStream::openMvs() {
         return false;
     }
 
-    // 连续采集：关闭触发，自动曝光/增益，输出 BayerRG8 彩色。
+    // 连续采集：关闭触发，固定曝光、关闭增益，输出 BayerRG8 彩色。
+    // 灯条是强光源，自动曝光/增益会把它们过曝成白色，导致颜色掩膜抓不到；
+    // 因此关闭增益并把曝光固定到 4000us。
     MV_CC_SetEnumValue(handle, "TriggerMode", 0);
-    MV_CC_SetEnumValue(handle, "ExposureAuto", 2); // 2 = Continuous
-    MV_CC_SetEnumValue(handle, "GainAuto", 2);     // 2 = Continuous
+    MV_CC_SetEnumValue(handle, "ExposureAuto", 0);  // 0 = Off
+    MV_CC_SetFloatValue(handle, "ExposureTime", 4000.0F);
+    MV_CC_SetEnumValue(handle, "GainAuto", 0);      // 0 = Off
+    MV_CC_SetFloatValue(handle, "Gain", 0.0F);
     MV_CC_SetEnumValue(handle, "PixelFormat", PixelType_Gvsp_BayerRG8);
 
     if (MV_CC_StartGrabbing(handle) != MV_OK) {
@@ -152,8 +156,10 @@ bool CameraStream::grabMvs(cv::Mat& bgr) {
             break;
         }
         case PixelType_Gvsp_BayerRG8: {
+            // 该型号相机报告的 RG 相位实际对应 OpenCV 的 BG，直接按 BG 解拜耳，
+            // 否则 R/B 通道互换（红色灯条会被显示成蓝色）。
             const cv::Mat bayer(height, width, CV_8UC1, const_cast<unsigned char*>(data));
-            cv::cvtColor(bayer, converted, cv::COLOR_BayerRG2BGR);
+            cv::cvtColor(bayer, converted, cv::COLOR_BayerBG2BGR);
             break;
         }
         case PixelType_Gvsp_BayerGB8: {

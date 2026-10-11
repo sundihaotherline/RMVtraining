@@ -96,6 +96,21 @@ std::vector<ArmorDetection> armor_detect(const cv::Mat& pic, TeamColor enemy_col
     return detector.detect(pic, enemy_color);
 }
 
+std::vector<ArmorDetector::LightBar> armor_detect_debug(const cv::Mat& pic,
+                                                        TeamColor enemy_color) {
+    static NumberClassifier classifier;
+    static bool classifier_attempted = false;
+    static ArmorDetector detector;
+
+    if (!classifier_attempted) {
+        classifier_attempted = true;
+        classifier.load(datasetDirectory());
+        detector.setClassifier(classifier.loaded() ? &classifier : nullptr);
+    }
+
+    return detector.debugExtractBars(pic, enemy_color);
+}
+
 std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections,
                                    const CameraParameters& camera,
                                    const GimbalState& gimbal) {
@@ -158,8 +173,24 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
             continue;
         }
 
+        // 用已知物理尺寸把整块装甲板矩形反投影回图像，得到精准完整角点：
+        // solvePnP 求出的位姿结合 object_points 的完整宽高，能正则化掉
+        // 灯条端点截短造成的框偏小，保证角点覆盖整块板（中央数字完整）。
+        // 精度取决于标定内参；内参未标定时只起到矩形正则化作用。
+        std::vector<cv::Point2d> refined_corners;
+        cv::projectPoints(object_points, rvec, tvec, camera.camera_matrix,
+                          camera.distortion_coefficients, refined_corners);
+        ArmorDetection refined_detection = detection;
+        if (refined_corners.size() == 4) {
+            for (int i = 0; i < 4; ++i) {
+                refined_detection.corners[i] =
+                    cv::Point2f(static_cast<float>(refined_corners[i].x),
+                                static_cast<float>(refined_corners[i].y));
+            }
+        }
+
         ArmorPose pose;
-        pose.detection = detection;
+        pose.detection = refined_detection;
         pose.position_camera_m = position_camera;
         pose.position_gimbal_m = position_gimbal;
         // 云台坐标系偏航角：假设 x 向右、z 向前。

@@ -3,6 +3,9 @@
 #include "StudentTasks.hpp"
 #include "WebLogger.hpp"
 
+#include <opencv2/highgui.hpp>
+#include <opencv2/imgproc.hpp>
+
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -35,6 +38,10 @@ constexpr auto kMessageMaxAge = std::chrono::milliseconds(500);
 static_assert(std::atomic<bool>::is_always_lock_free,
               "退出标志必须支持无锁原子操作");
 std::atomic<bool> shutdown_requested{false};
+
+// [离线调试] 串口是否已连接。为 false 时跳过串口收发与控制器依赖，
+// 仅用相机跑实时检测/框选（敌方颜色见 debugEnemyColor()）。
+bool serial_connected = false;
 
 // 下面几个全局变量对应参考工程中的 camera、temp、translator、pic。
 // 相机 SDK 的对象和生命周期由学生在 get_pic() 中自行管理，这里保存已标定参数。
@@ -113,6 +120,17 @@ bool hasFrameMarkers(const char* frame) noexcept {
 bool hasFiniteControlInput(const MessData_AutoAim& message) noexcept {
     return std::isfinite(message.yaw) && std::isfinite(message.pitch) &&
            std::isfinite(message.roll) && std::isfinite(message.bias);
+}
+
+// [离线调试] 无串口时决定敌方颜色，可用环境变量 RMV_ENEMY_COLOR=blue 覆盖，
+// 默认红色敌方（对应参考工程 status==5 的场景）。
+TeamColor debugEnemyColor() {
+    static const TeamColor color = [] {
+        const char* env = std::getenv("RMV_ENEMY_COLOR");
+        return (env != nullptr && std::string(env) == "blue") ? TeamColor::Blue
+                                                              : TeamColor::Red;
+    }();
+    return color;
 }
 
 void publishFrame(const Translator& incoming) {
@@ -210,38 +228,41 @@ int main(int argc, char** argv) {
 
     std::string camera_error;
     if (!loadCameraParameters(options.camera_config, camera, camera_error)) {
-        std::cerr << camera_error << '\n';
-        return EXIT_FAILURE;
+        // [离线调试] 相机未标定时不退出，仍可跑实时检测/框选（PnP 会被跳过）。
+        std::cerr << "[离线调试] " << camera_error << '\n';
     }
 
     // 与参考工程一样，串口对象在 main 中创建，再把指针传给两个线程。
+    // [离线调试] 串口打不开时不退出，仅关闭串口收发。
     SerialPort* serialPort = new SerialPort(options.serial_device);
-    if (!serialPort->isOpen()) {
-        std::cerr << "无法打开串口设备: " << options.serial_device << '\n';
-        delete serialPort;
-        return EXIT_FAILURE;
-    }
-    if (!serialPort->InitSerialPort(options.baud_rate, 8, 1, 'N')) {
+    serial_connected = serialPort->isOpen();
+    if (!serial_connected) {
+        std::cerr << "[离线调试] 未打开串口设备: " << options.serial_device
+                  << "，仅运行相机实时检测\n";
+    } else if (!serialPort->InitSerialPort(options.baud_rate, 8, 1, 'N')) {
         std::cerr << "串口配置失败\n";
         delete serialPort;
         return EXIT_FAILURE;
     }
 
     // 先同步读取首帧并缓存控制器状态；后续每帧仍会重新读取 status 来确定敌方颜色。
-    Translator first_frame{};
-    const int initial_result = readInitialFrame(*serialPort, first_frame);
-    if (initial_result < 0) {
-        std::cerr << "读取串口首帧失败\n";
-        delete serialPort;
-        return EXIT_FAILURE;
-    }
-    if (initial_result > 0) {
-        publishFrame(first_frame);
-        std::cout << "收到首帧，status = "
-                  << static_cast<unsigned int>(first_frame.message.status) << '\n';
-    } else {
-        // 首帧超时不直接退出，读线程启动后仍会继续等待控制器数据。
-        std::cerr << "未在启动阶段收到合法首帧，继续等待串口数据\n";
+    // [离线调试] 无串口时跳过首帧读取。
+    if (serial_connected) {
+        Translator first_frame{};
+        const int initial_result = readInitialFrame(*serialPort, first_frame);
+        if (initial_result < 0) {
+            std::cerr << "读取串口首帧失败\n";
+            delete serialPort;
+            return EXIT_FAILURE;
+        }
+        if (initial_result > 0) {
+            publishFrame(first_frame);
+            std::cout << "收到首帧，status = "
+                      << static_cast<unsigned int>(first_frame.message.status) << '\n';
+        } else {
+            // 首帧超时不直接退出，读线程启动后仍会继续等待控制器数据。
+            std::cerr << "未在启动阶段收到合法首帧，继续等待串口数据\n";
+        }
     }
 
     pthread_t readThread{};
@@ -250,12 +271,15 @@ int main(int argc, char** argv) {
     bool operation_started = false;
 
     // 保留参考工程的 pthread 双线程结构：先创建读线程，再创建操作线程。
-    if (pthread_create(&readThread, nullptr, ReadFunction, serialPort) == 0) {
-        read_started = true;
-    } else {
-        std::cerr << "创建串口读线程失败\n";
+    // [离线调试] 无串口时跳过读线程，但仍创建操作线程跑相机检测。
+    if (serial_connected) {
+        if (pthread_create(&readThread, nullptr, ReadFunction, serialPort) == 0) {
+            read_started = true;
+        } else {
+            std::cerr << "创建串口读线程失败\n";
+        }
     }
-    if (read_started &&
+    if ((!serial_connected || read_started) &&
         pthread_create(&operationThread, nullptr, OperationFunction, serialPort) == 0) {
         operation_started = true;
     } else {
@@ -348,23 +372,26 @@ void *OperationFunction(void *arg) {
         const auto process_start = std::chrono::steady_clock::now();
         std::chrono::steady_clock::time_point received_at{};
 
-        // 对应 aimbot_26 中的 MManager.copy(temp, translator)。
-        if (!copyLatestFrame(translator, received_at)) {
-            std::this_thread::sleep_for(kIdleDelay);
-            continue;
-        }
+        GimbalState gimbal{};
+        if (serial_connected) {
+            // 对应 aimbot_26 中的 MManager.copy(temp, translator)。
+            if (!copyLatestFrame(translator, received_at)) {
+                std::this_thread::sleep_for(kIdleDelay);
+                continue;
+            }
 
-        // 不支持的状态或异常姿态不进入学生算法，直接回传无目标帧。
-        if (!frameIsFresh(received_at) || !isAutoAimStatus(translator.message.status) ||
-            !hasFiniteControlInput(translator.message)) {
-            setSafeOutput(translator);
-            writeFrame(*serialPort, translator);
-            // 同一份过期快照可能会被重复看到，避免无休止地高速回包。
-            std::this_thread::sleep_for(kIdleDelay);
-            continue;
+            // 不支持的状态或异常姿态不进入学生算法，直接回传无目标帧。
+            if (!frameIsFresh(received_at) || !isAutoAimStatus(translator.message.status) ||
+                !hasFiniteControlInput(translator.message)) {
+                setSafeOutput(translator);
+                writeFrame(*serialPort, translator);
+                // 同一份过期快照可能会被重复看到，避免无休止地高速回包。
+                std::this_thread::sleep_for(kIdleDelay);
+                continue;
+            }
+            gimbal = gimbalStateFromMessage(translator.message);
         }
-
-        const GimbalState gimbal = gimbalStateFromMessage(translator.message);
+        // [离线调试] 无串口时 gimbal 保持 0，敌方颜色由 debugEnemyColor() 决定。
 
         // 对应参考工程中的 camera.get_pic(&pic, ...)。具体 SDK 初始化和取流由学生完成。
         pic.release();
@@ -380,7 +407,9 @@ void *OperationFunction(void *arg) {
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - process_start)
                         .count());
-                writeFrame(*serialPort, translator);
+                if (serial_connected) {
+                    writeFrame(*serialPort, translator);
+                }
                 std::cerr << "连续取流失败，操作线程退出\n";
                 shutdown_requested.store(true, std::memory_order_relaxed);
                 break;
@@ -408,8 +437,10 @@ void *OperationFunction(void *arg) {
         last_frame_time = frame_time;
 
         // 1. 装甲板检测。检测结果为空时不提前结束，继续向下传递空观测。
-        const std::vector<ArmorDetection> detections =
-            armor_detect(pic, enemyColorFromStatus(translator.message.status));
+        const TeamColor enemy_color =
+            serial_connected ? enemyColorFromStatus(translator.message.status)
+                             : debugEnemyColor();
+        const std::vector<ArmorDetection> detections = armor_detect(pic, enemy_color);
         WEB_LOG("armor_count", static_cast<double>(detections.size()));
         if (!detections.empty()) {
             // 记录第一块候选装甲板，便于在网页中快速判断检测器是否工作。
@@ -421,6 +452,42 @@ void *OperationFunction(void *arg) {
                  first_detection.corners[2] + first_detection.corners[3]) * 0.25F;
             WEB_LOG("target_x_px", center.x);
             WEB_LOG("target_y_px", center.y);
+        }
+
+        // [离线调试] 实时框选可视化，ESC 退出。
+        if (!serial_connected && !pic.empty()) {
+            cv::Mat vis = pic.clone();
+            // 灯条级中间结果：即使没配成装甲板也画出来，便于判断检测器工作状态。
+            const auto bars = armor_detect_debug(pic, enemy_color);
+            for (const auto& b : bars) {
+                cv::line(vis, b.top, b.bottom, cv::Scalar(0, 255, 255), 2);
+                cv::circle(vis, b.center, 4, cv::Scalar(0, 255, 255), -1);
+            }
+            for (const ArmorDetection& d : detections) {
+                std::vector<cv::Point> pts;
+                for (const cv::Point2f& c : d.corners) {
+                    pts.emplace_back(static_cast<int>(std::lround(c.x)),
+                                     static_cast<int>(std::lround(c.y)));
+                }
+                cv::polylines(vis, std::vector<std::vector<cv::Point>>{pts}, true,
+                              cv::Scalar(0, 255, 0), 2);
+                const cv::Point2f center = (d.corners[0] + d.corners[1] +
+                                            d.corners[2] + d.corners[3]) * 0.25F;
+                cv::putText(vis, std::to_string(d.target_id),
+                            center + cv::Point2f(4, 0), cv::FONT_HERSHEY_SIMPLEX,
+                            0.9, cv::Scalar(0, 255, 0), 2);
+            }
+            // 状态文字：灯条数、装甲数、敌方颜色。
+            const std::string status =
+                "bars=" + std::to_string(bars.size()) +
+                " armor=" + std::to_string(detections.size()) +
+                " enemy=" + (enemy_color == TeamColor::Red ? "red" : "blue");
+            cv::putText(vis, status, cv::Point(12, 30), cv::FONT_HERSHEY_SIMPLEX,
+                        0.8, cv::Scalar(0, 255, 0), 2);
+            cv::imshow("armor debug", vis);
+            if (cv::waitKey(1) == 27) {
+                shutdown_requested.store(true, std::memory_order_relaxed);
+            }
         }
 
         // 2. PnP 位姿解算。PnP 失败时同样保留空 observations，交给 EKF 做纯预测。
@@ -461,7 +528,9 @@ void *OperationFunction(void *arg) {
         logPrediction(prediction_valid ? prediction : PredictionResult{});
 
         // 4. 将结果写回原 64 字节结构体。
-        writeFrame(*serialPort, translator);
+        if (serial_connected) {
+            writeFrame(*serialPort, translator);
+        }
     }
 
     STOP_WEB_SERVER();
