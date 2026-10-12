@@ -12,6 +12,7 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -427,11 +428,13 @@ void *OperationFunction(void *arg) {
         }
 
         const auto frame_time = std::chrono::steady_clock::now();
+        double camera_fps = 0.0;
         if (last_frame_time.time_since_epoch().count() != 0) {
             const double frame_seconds =
                 std::chrono::duration<double>(frame_time - last_frame_time).count();
             if (frame_seconds > 0.0) {
-                WEB_LOG("camera_fps", 1.0 / frame_seconds);
+                camera_fps = 1.0 / frame_seconds;
+                WEB_LOG("camera_fps", camera_fps);
             }
         }
         last_frame_time = frame_time;
@@ -454,6 +457,16 @@ void *OperationFunction(void *arg) {
             WEB_LOG("target_y_px", center.y);
         }
 
+        // 2. PnP 位姿解算。PnP 失败时同样保留空 observations，交给 EKF 做纯预测。
+        const std::vector<ArmorPose> observations =
+            armor_solve(detections, camera, gimbal);
+        if (!observations.empty()) {
+            WEB_LOG("pnp_reprojection_error", observations.front().reprojection_error);
+            WEB_LOG("pnp_distance_m", cv::norm(observations.front().position_gimbal_m));
+        } else {
+            WEB_LOG("pnp_reprojection_error", -1.0);
+        }
+
         // [离线调试] 实时框选可视化，ESC 退出。
         if (!serial_connected && !pic.empty()) {
             cv::Mat vis = pic.clone();
@@ -471,33 +484,42 @@ void *OperationFunction(void *arg) {
                 }
                 cv::polylines(vis, std::vector<std::vector<cv::Point>>{pts}, true,
                               cv::Scalar(0, 255, 0), 2);
+                // 四个角点画成实心圆点。
+                for (const cv::Point2f& c : d.corners) {
+                    cv::circle(vis, cv::Point(static_cast<int>(std::lround(c.x)),
+                                              static_cast<int>(std::lround(c.y))),
+                               5, cv::Scalar(0, 0, 255), -1);
+                }
                 const cv::Point2f center = (d.corners[0] + d.corners[1] +
                                             d.corners[2] + d.corners[3]) * 0.25F;
                 cv::putText(vis, std::to_string(d.target_id),
                             center + cv::Point2f(4, 0), cv::FONT_HERSHEY_SIMPLEX,
                             0.9, cv::Scalar(0, 255, 0), 2);
             }
-            // 状态文字：灯条数、装甲数、敌方颜色。
-            const std::string status =
-                "bars=" + std::to_string(bars.size()) +
-                " armor=" + std::to_string(detections.size()) +
-                " enemy=" + (enemy_color == TeamColor::Red ? "red" : "blue");
+            // PnP 位姿读数：每块装甲板标注距离与云台系偏航角（m / 度）。
+            for (const ArmorPose& p : observations) {
+                const cv::Point2f center = (p.detection.corners[0] +
+                                            p.detection.corners[1] +
+                                            p.detection.corners[2] +
+                                            p.detection.corners[3]) * 0.25F;
+                char pose[128];
+                std::snprintf(pose, sizeof(pose), "d=%.2fm yaw=%.1fdeg",
+                              cv::norm(p.position_gimbal_m),
+                              p.armor_yaw * 180.0 / CV_PI);
+                cv::putText(vis, pose, center + cv::Point2f(4, 22),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
+            }
+            // 状态文字：帧率、灯条数、装甲数、敌方颜色。
+            char status[160];
+            std::snprintf(status, sizeof(status), "fps=%.1f bars=%zu armor=%zu enemy=%s",
+                          camera_fps, bars.size(), detections.size(),
+                          enemy_color == TeamColor::Red ? "red" : "blue");
             cv::putText(vis, status, cv::Point(12, 30), cv::FONT_HERSHEY_SIMPLEX,
                         0.8, cv::Scalar(0, 255, 0), 2);
             cv::imshow("armor debug", vis);
             if (cv::waitKey(1) == 27) {
                 shutdown_requested.store(true, std::memory_order_relaxed);
             }
-        }
-
-        // 2. PnP 位姿解算。PnP 失败时同样保留空 observations，交给 EKF 做纯预测。
-        const std::vector<ArmorPose> observations =
-            armor_solve(detections, camera, gimbal);
-        if (!observations.empty()) {
-            WEB_LOG("pnp_reprojection_error", observations.front().reprojection_error);
-            WEB_LOG("pnp_distance_m", cv::norm(observations.front().position_gimbal_m));
-        } else {
-            WEB_LOG("pnp_reprojection_error", -1.0);
         }
 
         // 3. 计算帧间隔和通信延迟，再调用 EKF。即使 observations 为空也必须调用。
@@ -533,6 +555,9 @@ void *OperationFunction(void *arg) {
         }
     }
 
+    // 相机在操作线程内打开，也在此线程结束前显式关闭，避免进程退出阶段
+    // 静态析构时再调 MVS SDK 导致段错误。
+    close_camera();
     STOP_WEB_SERVER();
     return nullptr;
 }

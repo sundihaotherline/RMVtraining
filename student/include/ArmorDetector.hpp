@@ -12,9 +12,9 @@
 // 流程：
 //   1. HSV 颜色掩膜 + BGR 亮度掩膜，合成后做开、闭运算；
 //   2. 提取细长灯条轮廓，过滤角度/面积/长宽比/填充率；
-//   3. 左右灯条两两匹配得到装甲板候选；
+//   3. 左右灯条两两匹配（几何条件收紧），生成装甲板候选框；
 //   4. 生成顺时针排列的四个角点，按宽高比区分大小装甲板；
-//   5. 裁剪中央区域做数字分类，只有编号 1..5 才判定为有效目标。
+//   5. 对已框出的目标裁剪中央区域做数字分类（编号 1..9），识别失败保留框但编号置 0。
 class ArmorDetector {
 public:
     // 单个灯条候选（沿主轴拟合的线段）。
@@ -31,23 +31,30 @@ public:
     // 设置分类器；传入 nullptr 可禁用数字分类。
     void setClassifier(const NumberClassifier* classifier) { classifier_ = classifier; }
 
-    std::vector<ArmorDetection> detect(const cv::Mat& bgr, TeamColor enemy_color) const;
+    std::vector<ArmorDetection> detect(const cv::Mat& bgr, TeamColor enemy_color);
 
     // 调试：构建掩膜并提取灯条（不配对），供实时可视化反馈灯条级中间结果。
     std::vector<LightBar> debugExtractBars(const cv::Mat& bgr,
                                            TeamColor enemy_color) const {
         const cv::Mat mask = buildMask(bgr, enemy_color);
-        return extractLightBars(mask);
+        const cv::Mat strength = buildStrength(bgr);
+        return extractLightBars(mask, strength);
     }
 
 private:
     cv::Mat buildMask(const cv::Mat& bgr, TeamColor enemy_color) const;
-    std::vector<LightBar> extractLightBars(const cv::Mat& mask) const;
+    // 亮度图（V = max(R,G,B)），供灯条端点晕光裁剪。过曝灯条核心发白，
+    // 颜色差在白核处掉到 0 会误裁真灯条，亮度在核心最亮、bloom 渐暗更稳。
+    cv::Mat buildStrength(const cv::Mat& bgr) const;
+    std::vector<LightBar> extractLightBars(const cv::Mat& mask,
+                                           const cv::Mat& strength) const;
     // 从匹配的左右灯条生成角点与目标。返回 true 表示生成有效候选。
     bool buildDetection(const LightBar& left, const LightBar& right,
                         ArmorDetection& detection) const;
-    // 裁剪中央数字区域，分类并填写编号/置信度；无有效编号返回 false。
+    // 裁剪中央数字区域，分类并填写编号（1..9）/置信度；未识别返回 false。
     bool classifyCenter(const cv::Mat& bgr, ArmorDetection& detection) const;
 
     const NumberClassifier* classifier_{nullptr};
+    // 时间平滑状态：上一帧的框，用于对同目标做 EMA 角点平滑（检测丢失即清空，不留残影）。
+    std::vector<ArmorDetection> prev_boxes_;
 };

@@ -61,11 +61,16 @@ bool cornersInsideImage(const ArmorDetection& detection, const CameraParameters&
     return true;
 }
 
+// 相机取流单例。生命周期显式管理：get_pic 按需打开，close_camera 在操作线程
+// 结束前关闭，避免 CameraStream 析构函数在进程退出阶段调用 MVS SDK——
+// 此时 SDK 全局状态可能已析构，close() 会直接段错误。
+CameraStream g_camera_stream;
+
 }  // namespace
 
 bool get_pic(cv::Mat& pic) {
-    // 相机 SDK 的对象和生命周期在此函数内管理，取流结束后释放 SDK 缓冲。
-    static CameraStream stream;
+    // 相机 SDK 的对象和生命周期在 g_camera_stream 中统一管理，取流结束后释放 SDK 缓冲。
+    CameraStream& stream = g_camera_stream;
     if (!stream.isOpen()) {
         if (!stream.open()) {
             pic.release();
@@ -80,6 +85,10 @@ bool get_pic(cv::Mat& pic) {
     }
     pic = frame;
     return true;
+}
+
+void close_camera() {
+    g_camera_stream.close();
 }
 
 std::vector<ArmorDetection> armor_detect(const cv::Mat& pic, TeamColor enemy_color) {
@@ -173,24 +182,10 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
             continue;
         }
 
-        // 用已知物理尺寸把整块装甲板矩形反投影回图像，得到精准完整角点：
-        // solvePnP 求出的位姿结合 object_points 的完整宽高，能正则化掉
-        // 灯条端点截短造成的框偏小，保证角点覆盖整块板（中央数字完整）。
-        // 精度取决于标定内参；内参未标定时只起到矩形正则化作用。
-        std::vector<cv::Point2d> refined_corners;
-        cv::projectPoints(object_points, rvec, tvec, camera.camera_matrix,
-                          camera.distortion_coefficients, refined_corners);
-        ArmorDetection refined_detection = detection;
-        if (refined_corners.size() == 4) {
-            for (int i = 0; i < 4; ++i) {
-                refined_detection.corners[i] =
-                    cv::Point2f(static_cast<float>(refined_corners[i].x),
-                                static_cast<float>(refined_corners[i].y));
-            }
-        }
-
+        // 角点沿用检测器给出的灯条端点矩形，不再把整块装甲板外轮廓反投影回图像，
+        // 保证输出框与“只框灯条间部分”的约定一致。
         ArmorPose pose;
-        pose.detection = refined_detection;
+        pose.detection = detection;
         pose.position_camera_m = position_camera;
         pose.position_gimbal_m = position_gimbal;
         // 云台坐标系偏航角：假设 x 向右、z 向前。

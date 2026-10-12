@@ -67,7 +67,7 @@ bool CameraStream::openImageSource(const std::string& path) {
     if (image_paths_.empty()) {
         return false;
     }
-    mode_ = Mode::Image;
+    mode_ = Mode::Image;//切换为读图模式
     return true;
 }
 
@@ -76,10 +76,11 @@ bool CameraStream::openMvs() {
     MV_CC_DEVICE_INFO_LIST device_list{};
     if (MV_CC_EnumDevices(MV_GIGE_DEVICE | MV_USB_DEVICE, &device_list) != MV_OK ||
         device_list.nDeviceNum == 0) {
+           
         return false;
     }
 
-    MV_CC_DEVICE_INFO* device = device_list.pDeviceInfo[0];
+    MV_CC_DEVICE_INFO* device = device_list.pDeviceInfo[0]; //取零号相机
     if (!MV_CC_IsDeviceAccessible(device, MV_ACCESS_Exclusive)) {
         return false;
     }

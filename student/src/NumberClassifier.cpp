@@ -26,12 +26,31 @@ cv::Mat NumberClassifier::preprocess(const cv::Mat& roi) {
         gray = roi;
     }
 
-    // 数字是亮图案：先自适应阈值得到黑白图，再缩放到模板尺寸。
+    // 数字是亮图案：先自适应阈值得到黑白图。
     cv::Mat binary;
     cv::threshold(gray, binary, 0, 255,
                   cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+    // 只保留亮像素的包围盒并居中，再缩放到模板尺寸。模板与待分类图都走同一套
+    // 处理，消除数字在 ROI 内位置/大小不同造成的误分类（这是“只有 2 能被认出”的主因）。
+    std::vector<cv::Point> foreground;
+    cv::findNonZero(binary, foreground);
+    if (foreground.empty()) {
+        return cv::Mat::zeros(kHeight, kWidth, CV_32F);
+    }
+
+    cv::Rect box = cv::boundingRect(foreground);
+    // 外扩一点边距，避免数字笔画贴边被裁掉。
+    const int pad_x = std::max(1, box.width / 8);
+    const int pad_y = std::max(1, box.height / 8);
+    box.x = std::max(0, box.x - pad_x);
+    box.y = std::max(0, box.y - pad_y);
+    box.width = std::min(binary.cols - box.x, box.width + 2 * pad_x);
+    box.height = std::min(binary.rows - box.y, box.height + 2 * pad_y);
+
+    cv::Mat digit = binary(box);
     cv::Mat resized;
-    cv::resize(binary, resized, cv::Size(kWidth, kHeight), 0, 0,
+    cv::resize(digit, resized, cv::Size(kWidth, kHeight), 0, 0,
                cv::INTER_AREA);
 
     cv::Mat result;
@@ -63,11 +82,9 @@ bool NumberClassifier::load(const std::string& dataset_dir) {
             if (sample.empty()) {
                 continue;
             }
-            cv::Mat resized;
-            cv::resize(sample, resized, cv::Size(kWidth, kHeight), 0, 0,
-                       cv::INTER_AREA);
+            // 与 classify 使用同一套预处理（阈值 + 居中 + 缩放），保证模板与查询对齐。
             cv::Mat normalized;
-            resized.convertTo(normalized, CV_64F, 1.0 / 255.0);
+            preprocess(sample).convertTo(normalized, CV_64F);
             sum += normalized;
             ++count;
         }

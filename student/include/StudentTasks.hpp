@@ -11,6 +11,9 @@
 // 超时或断开时返回 false；不要在此函数中终止进程。
 bool get_pic(cv::Mat& pic);
 
+// 关闭相机并释放 SDK 资源。操作线程结束前调用，避免 SDK 在进程退出阶段析构崩溃。
+void close_camera();
+
 // 任务 2：检测敌方装甲板并识别其编号。每个结果必须包含四个按顺时针排列的
 // 图像角点、装甲板尺寸、目标编号和置信度。
 std::vector<ArmorDetection> armor_detect(const cv::Mat& pic, TeamColor enemy_color);
