@@ -80,6 +80,9 @@ bool get_pic(cv::Mat& pic) {
 
     cv::Mat frame;
     if (!stream.grab(frame) || frame.empty() || frame.channels() != 3) {
+        // 取流失败（相机可能已断开）：释放失效句柄并把模式复位，使下一帧重新
+        // open() 枚举设备重连，而不是用旧 handle 无限空转。
+        stream.close();
         pic.release();
         return false;
     }

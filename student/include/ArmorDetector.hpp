@@ -43,10 +43,6 @@ public:
 
 private:
     cv::Mat buildMask(const cv::Mat& bgr, TeamColor enemy_color) const;
-    // 颜色掩膜 & 通道差掩膜（形态学之前）。
-    cv::Mat buildRawMask(const cv::Mat& bgr, TeamColor enemy_color) const;
-    // 对合成掩膜做开+闭运算。
-    cv::Mat morphOpenClose(const cv::Mat& raw) const;
     // 亮度图（V = max(R,G,B)），供灯条端点晕光裁剪。过曝灯条核心发白，
     // 颜色差在白核处掉到 0 会误裁真灯条，亮度在核心最亮、bloom 渐暗更稳。
     cv::Mat buildStrength(const cv::Mat& bgr) const;
