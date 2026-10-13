@@ -35,6 +35,20 @@ std::string datasetDirectory() {
     return "datasets";
 }
 
+// 共享检测器单例：armor_detect 与可视化必须用同一个实例，使 detect() 缓存的
+// 灯条、以及时间平滑状态（prev_boxes_）保持一致，避免可视化再跑一遍检测流水线。
+ArmorDetector& sharedDetector() {
+    static NumberClassifier classifier;
+    static bool classifier_attempted = false;
+    static ArmorDetector detector;
+    if (!classifier_attempted) {
+        classifier_attempted = true;
+        classifier.load(datasetDirectory());
+        detector.setClassifier(classifier.loaded() ? &classifier : nullptr);
+    }
+    return detector;
+}
+
 // 以装甲板中心为原点建立物点：x 向右、y 向下、z 指向相机，单位米。
 // 角点顺序与 ArmorDetection::corners 一致（左上、右上、右下、左下）。
 std::vector<cv::Point3d> buildObjectPoints(ArmorSize size) {
@@ -95,32 +109,13 @@ void close_camera() {
 }
 
 std::vector<ArmorDetection> armor_detect(const cv::Mat& pic, TeamColor enemy_color) {
-    static NumberClassifier classifier;
-    static bool classifier_attempted = false;
-    static ArmorDetector detector;
-
-    if (!classifier_attempted) {
-        classifier_attempted = true;
-        classifier.load(datasetDirectory());
-        detector.setClassifier(classifier.loaded() ? &classifier : nullptr);
-    }
-
-    return detector.detect(pic, enemy_color);
+    return sharedDetector().detect(pic, enemy_color);
 }
 
-std::vector<ArmorDetector::LightBar> armor_detect_debug(const cv::Mat& pic,
-                                                        TeamColor enemy_color) {
-    static NumberClassifier classifier;
-    static bool classifier_attempted = false;
-    static ArmorDetector detector;
-
-    if (!classifier_attempted) {
-        classifier_attempted = true;
-        classifier.load(datasetDirectory());
-        detector.setClassifier(classifier.loaded() ? &classifier : nullptr);
-    }
-
-    return detector.debugExtractBars(pic, enemy_color);
+std::vector<ArmorDetector::LightBar> armor_detect_debug(const cv::Mat&,
+                                                        TeamColor) {
+    // 直接返回 detect() 已提取并缓存的灯条，避免可视化重复跑掩膜/轮廓。
+    return sharedDetector().lastBars();
 }
 
 std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections,
@@ -201,6 +196,50 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         poses.push_back(pose);
     }
     return poses;
+}
+
+PnPDiagnostic armor_solve_debug(const ArmorDetection& detection,
+                                const CameraParameters& camera) {
+    PnPDiagnostic diag;
+    diag.camera_valid = camera.valid();
+    if (!diag.camera_valid) {
+        return diag;
+    }
+
+    diag.corners_inside = cornersInsideImage(detection, camera);
+    if (!diag.corners_inside) {
+        return diag;
+    }
+
+    const std::vector<cv::Point3d> object_points = buildObjectPoints(detection.size);
+    const std::vector<cv::Point2f> image_points(detection.corners.begin(),
+                                                detection.corners.end());
+    cv::Mat rvec, tvec;
+    diag.solved =
+        cv::solvePnP(object_points, image_points, camera.camera_matrix,
+                     camera.distortion_coefficients, rvec, tvec, false,
+                     cv::SOLVEPNP_ITERATIVE);
+    if (!diag.solved || tvec.rows != 3 || tvec.cols != 1) {
+        return diag;
+    }
+
+    diag.depth_m = tvec.at<double>(2, 0);
+    diag.depth_in_range = std::isfinite(diag.depth_m) && diag.depth_m >= kMinDepthM &&
+                          diag.depth_m <= kMaxDepthM;
+
+    std::vector<cv::Point2d> projected;
+    cv::projectPoints(object_points, rvec, tvec, camera.camera_matrix,
+                      camera.distortion_coefficients, projected);
+    double reprojection = 0.0;
+    for (std::size_t i = 0; i < projected.size(); ++i) {
+        const double dx = projected[i].x - image_points[i].x;
+        const double dy = projected[i].y - image_points[i].y;
+        reprojection += std::sqrt(dx * dx + dy * dy);
+    }
+    diag.reprojection_error_px = reprojection / static_cast<double>(projected.size());
+    diag.reprojection_ok = std::isfinite(diag.reprojection_error_px) &&
+                           diag.reprojection_error_px <= kMaxReprojectionErrorPx;
+    return diag;
 }
 
 PredictionResult ekf_predict(const std::vector<ArmorPose>&, const GimbalState&, double) {

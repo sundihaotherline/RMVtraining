@@ -367,6 +367,7 @@ void *OperationFunction(void *arg) {
     double dt = 0.0;
     double last_time_stamp = 0.0;
     auto last_frame_time = std::chrono::steady_clock::time_point{};
+    auto last_viz_time = std::chrono::steady_clock::time_point{};
     int empty_frame_count = 0;
 
     while (!shutdown_requested.load(std::memory_order_relaxed)) {
@@ -458,8 +459,12 @@ void *OperationFunction(void *arg) {
             WEB_LOG("pnp_reprojection_error", -1.0);
         }
 
-        // [离线调试] 实时框选可视化，ESC 退出。
-        if (!serial_connected && !pic.empty()) {
+        // [离线调试] 实时框选可视化，ESC 退出。按 ~30fps 节流刷新窗口，
+        // 其余帧跳过 imshow/重绘，避免把处理流水线拖慢。
+        if (!serial_connected && !pic.empty() &&
+            std::chrono::steady_clock::now() - last_viz_time >=
+                std::chrono::milliseconds(33)) {
+            last_viz_time = std::chrono::steady_clock::now();
             cv::Mat vis = pic.clone();
             // 灯条级中间结果：即使没配成装甲板也画出来，便于判断检测器工作状态。
             const auto bars = armor_detect_debug(pic, enemy_color);
@@ -514,7 +519,31 @@ void *OperationFunction(void *arg) {
                           enemy_color == TeamColor::Red ? "red" : "blue");
             cv::putText(vis, status, cv::Point(12, 30), cv::FONT_HERSHEY_SIMPLEX,
                         0.8, cv::Scalar(0, 255, 0), 2);
-            cv::imshow("armor debug", vis);
+            // PnP 诊断：对首个检测框逐项显示每道拒绝门槛的通过情况与数值。
+            if (!detections.empty()) {
+                const PnPDiagnostic diag = armor_solve_debug(detections.front(), camera);
+                const char* size_name =
+                    detections.front().size == ArmorSize::Large ? "L" : "S";
+                char line[256];
+                std::snprintf(line, sizeof(line),
+                              "PnP: size=%s cam=%d corner=%d solved=%d depth=%.2f(in=%d) reproj=%.1f(ok=%d)",
+                              size_name, diag.camera_valid ? 1 : 0,
+                              diag.corners_inside ? 1 : 0,
+                              diag.solved ? 1 : 0, diag.depth_m,
+                              diag.depth_in_range ? 1 : 0, diag.reprojection_error_px,
+                              diag.reprojection_ok ? 1 : 0);
+                cv::putText(vis, line, cv::Point(12, 58), cv::FONT_HERSHEY_SIMPLEX,
+                            0.7, cv::Scalar(0, 255, 255), 2);
+            }
+            // 缩小后再显示，降低窗口渲染开销（框/文字仍按原分辨率坐标绘制）。
+            cv::Mat display;
+            if (vis.cols > 960) {
+                const double scale = 960.0 / static_cast<double>(vis.cols);
+                cv::resize(vis, display, cv::Size(), scale, scale, cv::INTER_AREA);
+            } else {
+                display = vis;
+            }
+            cv::imshow("armor debug", display);
             if (cv::waitKey(1) == 27) {
                 shutdown_requested.store(true, std::memory_order_relaxed);
             }

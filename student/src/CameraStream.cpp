@@ -103,6 +103,8 @@ bool CameraStream::openMvs() {
     MV_CC_SetEnumValue(handle, "GainAuto", 0);      // 0 = Off
     MV_CC_SetFloatValue(handle, "Gain", 0.0F);
     MV_CC_SetEnumValue(handle, "PixelFormat", PixelType_Gvsp_BayerRG8);
+    // 显式固定采集帧率 100fps。曝光 4000us 远小于帧周期 10ms，不会互相冲突。
+    MV_CC_SetFloatValue(handle, "AcquisitionFrameRate", 100.0F);
 
     if (MV_CC_StartGrabbing(handle) != MV_OK) {
         MV_CC_CloseDevice(handle);

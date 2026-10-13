@@ -33,13 +33,9 @@ public:
 
     std::vector<ArmorDetection> detect(const cv::Mat& bgr, TeamColor enemy_color);
 
-    // 调试：构建掩膜并提取灯条（不配对），供实时可视化反馈灯条级中间结果。
-    std::vector<LightBar> debugExtractBars(const cv::Mat& bgr,
-                                           TeamColor enemy_color) const {
-        const cv::Mat mask = buildMask(bgr, enemy_color);
-        const cv::Mat strength = buildStrength(bgr);
-        return extractLightBars(mask, strength);
-    }
+    // 最近一次 detect() 提取的灯条（含未配对的），供可视化直接读取，避免可视化
+    // 再跑一遍 buildMask/extract 的重复计算。
+    const std::vector<LightBar>& lastBars() const { return last_bars_; }
 
 private:
     cv::Mat buildMask(const cv::Mat& bgr, TeamColor enemy_color) const;
@@ -57,4 +53,6 @@ private:
     const NumberClassifier* classifier_{nullptr};
     // 时间平滑状态：上一帧的框，用于对同目标做 EMA 角点平滑（检测丢失即清空，不留残影）。
     std::vector<ArmorDetection> prev_boxes_;
+    // 最近一次 detect() 提取的灯条缓存，供可视化读取（见 lastBars()）。
+    std::vector<LightBar> last_bars_;
 };

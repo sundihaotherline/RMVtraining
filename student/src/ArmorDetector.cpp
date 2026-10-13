@@ -20,15 +20,15 @@ constexpr int kRedHueHigh2 = 180;
 constexpr int kBlueHueLow = 100;
 constexpr int kBlueHueHigh = 124;
 constexpr int kColorSaturationMin = 80;
-constexpr int kColorValueMin = 30;
+constexpr int kColorValueMin = 20;
 // ---- BGR 通道差掩膜阈值 ----
-constexpr int kChannelDiffMin = 40;
+constexpr int kChannelDiffMin = 32;
 
 // ---- 灯条候选过滤 ----
-constexpr double kMinLengthRatio = 0.04;   // 相对图像高度
-constexpr double kMinAspectRatio = 2.0;    // 长度/宽度
+constexpr double kMinLengthRatio = 0.03;   // 相对图像高度（1080p≈32px，放开识别距离）
+constexpr double kMinAspectRatio = 1.5;    // 长度/宽度（侧对时灯条变胖，放宽）
 constexpr double kMaxAngleDeg = 60.0;      // 相对竖直方向：允许装甲板绕中心 roll 到 60°
-constexpr double kMinFillRatio = 0.4;      // 轮廓面积 / 外接矩形面积
+constexpr double kMinFillRatio = 0.35;     // 轮廓面积 / 外接矩形面积
 constexpr double kMinBarArea = 40.0;       // 侧对时灯条变窄，放宽最小面积
 // 灯条端点晕光裁剪：沿主轴采样颜色强度，强度低于该灯条峰值强度的
 // 该比例处视为 bloom 边界。近端饱和 LED 的 bloom 更亮、更拖尾，
@@ -40,9 +40,10 @@ constexpr double kBarTrimStrengthRatio = 0.6;
 // 只在几何上足够吻合时才生成候选框。
 constexpr double kMaxLengthRatio = 1.6;      // 长度比：同板两灯条长度应接近
 constexpr double kMaxAngleDiffDeg = 12.0;    // 角度差：两灯条应近乎平行
-// 中心距/平均长度。下限收到 1.0（侧对时两灯条在图像上靠得更近，但不允许近到
-// 几乎重叠）；上限收到 4.5（大装甲 230/57≈4.04），避免把相邻装甲板灯条错配。
-constexpr double kMinPairWidthRatio = 1.0;
+// 中心距/平均长度。下限放开到 0.6：侧对时两灯条在图像上靠得更近，0.6 对应约
+// 75° 侧对角度；再低（0.4~0.5）只多换 3~5°，却让不同装甲板灯条错配风险陡增，
+// 反而伤精度，故停在 0.6。上限收到 4.5（大装甲 230/57≈4.04），避免相邻板错配。
+constexpr double kMinPairWidthRatio = 0.6;
 constexpr double kMaxPairWidthRatio = 4.5;
 constexpr double kMaxAlongAxisOffsetRatio = 0.35; // 中心沿灯条主轴偏移/平均长度
 // 大小装甲板分界：中心距/灯条长度（小 135/57≈2.37，大 230/57≈4.04）。
@@ -130,9 +131,10 @@ cv::Mat ArmorDetector::buildMask(const cv::Mat& bgr, TeamColor enemy_color) cons
     cv::Mat kernel_open = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
     // 各向同性方形核：灯条是一排 LED，LED 间有几像素暗缝，相机滚转使灯条在
     // 画面里倾斜时，这些暗缝方向也随之倾斜，竖直细长核（3x15）桥接不到、
-    // 灯条被切成一堆短碎片被 min_length 砍掉。方形核任意方向都能桥接 LED 暗缝；
-    // 左右两根灯条中心距在有效距离内都远大于 9px，不会把两根粘成一体。
-    cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 9));
+    // 灯条被切成一堆短碎片被 min_length 砍掉。方形核任意方向都能桥接 LED 暗缝。
+    // 距离越远灯条越小、暗缝的相对像素占比越大，9x9 在 1.6m 附近已桥不住，故
+    // 加大到 13x13；两灯条中心距在有效距离内 >150px，不会把两根粘成一体。
+    cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(13, 13));
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel_open);
     cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel_close);
     return mask;
@@ -332,6 +334,7 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
     const cv::Mat mask = buildMask(bgr, enemy_color);
     const cv::Mat strength = buildStrength(bgr);
     std::vector<LightBar> bars = extractLightBars(mask, strength);
+    last_bars_ = bars;
 
     if (bars.size() < 2) {
         return results;

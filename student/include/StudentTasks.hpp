@@ -28,6 +28,20 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
                                   const CameraParameters& camera,
                                   const GimbalState& gimbal);
 
+// 调试：对单块检测框复算 PnP，逐项记录每一道拒绝门槛的通过情况与数值，
+// 用于定位“PnP 位姿解算失败 / 读数不显示”的确切断点。
+struct PnPDiagnostic {
+    bool camera_valid = false;
+    bool corners_inside = false;
+    bool solved = false;
+    double depth_m = 0.0;
+    bool depth_in_range = false;
+    double reprojection_error_px = 0.0;
+    bool reprojection_ok = false;
+};
+PnPDiagnostic armor_solve_debug(const ArmorDetection& detection,
+                                const CameraParameters& camera);
+
 // 任务 4：完成观测关联，更新旋转目标 EKF，并预测云台指令。
 // timestamp_seconds 单调递增；prediction_bias_s 来自控制器。
 PredictionResult ekf_predict(const std::vector<ArmorPose>& observations,
