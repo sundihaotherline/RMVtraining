@@ -56,12 +56,13 @@ struct ArmorDetection {
 };
 
 struct ArmorPose {
-    // 平移向量单位为米。armor_yaw 是云台坐标系中的偏航角（弧度），
-    // reprojection_error 是单个观测的重投影误差（像素）。
+    // 平移向量单位为米。armor_yaw / armor_pitch 是云台坐标系中的偏航/俯仰角
+    // （弧度，x 向右、y 向下、z 向前），reprojection_error 是单个观测的重投影误差（像素）。
     ArmorDetection detection;
     cv::Vec3d position_camera_m{0.0, 0.0, 0.0};
     cv::Vec3d position_gimbal_m{0.0, 0.0, 0.0};
     double armor_yaw{0.0};
+    double armor_pitch{0.0};
     double reprojection_error{0.0};
 };
 

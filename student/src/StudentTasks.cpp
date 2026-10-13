@@ -190,6 +190,10 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         pose.position_gimbal_m = position_gimbal;
         // 云台坐标系偏航角：假设 x 向右、z 向前。
         pose.armor_yaw = std::atan2(position_gimbal[0], position_gimbal[2]);
+        // 俯仰角：y 向下，故向上为正；对 y 取负，水平距离取 sqrt(x^2+z^2)。
+        pose.armor_pitch = std::atan2(-position_gimbal[1],
+                                      std::sqrt(position_gimbal[0] * position_gimbal[0] +
+                                                position_gimbal[2] * position_gimbal[2]));
         pose.reprojection_error = reprojection_error;
         poses.push_back(pose);
     }

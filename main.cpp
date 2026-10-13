@@ -496,17 +496,24 @@ void *OperationFunction(void *arg) {
                             center + cv::Point2f(4, 0), cv::FONT_HERSHEY_SIMPLEX,
                             0.9, cv::Scalar(0, 255, 0), 2);
             }
-            // PnP 位姿读数：每块装甲板标注距离与云台系偏航角（m / 度）。
+            // PnP 位姿读数：每块装甲板标注距离、云台系偏航/俯仰角与 (x,y,z) 坐标。
             for (const ArmorPose& p : observations) {
                 const cv::Point2f center = (p.detection.corners[0] +
                                             p.detection.corners[1] +
                                             p.detection.corners[2] +
                                             p.detection.corners[3]) * 0.25F;
                 char pose[128];
-                std::snprintf(pose, sizeof(pose), "d=%.2fm yaw=%.1fdeg",
+                std::snprintf(pose, sizeof(pose), "d=%.2fm yaw=%.1fdeg pitch=%.1fdeg",
                               cv::norm(p.position_gimbal_m),
-                              p.armor_yaw * 180.0 / CV_PI);
+                              p.armor_yaw * 180.0 / CV_PI,
+                              p.armor_pitch * 180.0 / CV_PI);
                 cv::putText(vis, pose, center + cv::Point2f(4, 22),
+                            cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
+                char xyz[128];
+                std::snprintf(xyz, sizeof(xyz), "xyz=(%.2f, %.2f, %.2f)m",
+                              p.position_gimbal_m[0], p.position_gimbal_m[1],
+                              p.position_gimbal_m[2]);
+                cv::putText(vis, xyz, center + cv::Point2f(4, 42),
                             cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 255), 2);
             }
             // 状态文字：帧率、灯条数、装甲数、敌方颜色。

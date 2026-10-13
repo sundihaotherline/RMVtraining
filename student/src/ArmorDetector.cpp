@@ -27,7 +27,7 @@ constexpr int kChannelDiffMin = 40;
 // ---- 灯条候选过滤 ----
 constexpr double kMinLengthRatio = 0.04;   // 相对图像高度
 constexpr double kMinAspectRatio = 2.0;    // 长度/宽度
-constexpr double kMaxAngleDeg = 60.0;      // 相对竖直方向：允许装甲板绕中心 roll 到 60°
+constexpr double kMaxAngleDeg = 45.0;      // 相对竖直方向（真实场景灯条可能倾斜）
 constexpr double kMinFillRatio = 0.4;      // 轮廓面积 / 外接矩形面积
 constexpr double kMinBarArea = 40.0;       // 侧对时灯条变窄，放宽最小面积
 // 灯条端点晕光裁剪：沿主轴采样颜色强度，强度低于该灯条峰值强度的
@@ -36,60 +36,37 @@ constexpr double kMinBarArea = 40.0;       // 侧对时灯条变窄，放宽最�
 constexpr double kBarTrimStrengthRatio = 0.6;
 
 // ---- 左右灯条匹配 ----
-// 配对条件整体收紧：多灯条场景下避免把不同装甲板的灯条错配成一块，
-// 只在几何上足够吻合时才生成候选框。
-constexpr double kMaxLengthRatio = 1.6;      // 长度比：同板两灯条长度应接近
-constexpr double kMaxAngleDiffDeg = 8.0;     // 角度差：两灯条应近乎平行
-// 中心距/平均长度。下限收到 1.0（侧对时两灯条在图像上靠得更近，但不允许近到
-// 几乎重叠）；上限收到 4.5（大装甲 230/57≈4.04），避免把相邻装甲板灯条错配。
-constexpr double kMinPairWidthRatio = 1.0;
+constexpr double kMaxLengthRatio = 2.0;    // 长度比
+constexpr double kMaxAngleDiffDeg = 10.0;//角度差
+// 中心距/平均长度。侧对时两灯条在图像上靠得更近，下限放宽到 0.6；
+// 上限收到 4.5（大装甲 230/57≈4.04），避免把相邻两块装甲板的灯条错配成一块。
+constexpr double kMinPairWidthRatio = 0.6;
 constexpr double kMaxPairWidthRatio = 4.5;
-constexpr double kMaxAlongAxisOffsetRatio = 0.35; // 中心沿灯条主轴偏移/平均长度
+constexpr double kMaxAlongAxisOffsetRatio = 0.5; // 中心沿灯条主轴偏移/平均长度
 // 大小装甲板分界：中心距/灯条长度（小 135/57≈2.37，大 230/57≈4.04）。
 constexpr double kLargeArmorRatio = 3.0;// 取中间值，避免小装甲板被误判为大装甲板。
 
 // ---- 数字分类 ----
 constexpr float kMinNumberConfidence = 0.5F;//图像贴纸与数据集相似度底线
 
-// ---- 时间平滑（EMA）----
-constexpr float kSmoothAlpha = 0.6F;   // 当前帧权重；上一帧权重 = 1 - alpha
-constexpr float kAssocDistPx = 60.0F;  // 相邻帧同目标关联的最大中心位移（像素）
-
 double dist(const cv::Point2f& a, const cv::Point2f& b) {
     return cv::norm(a - b);
-}
-
-// 装甲板框中心（四角均值）。
-cv::Point2f boxCenter(const ArmorDetection& d) {
-    cv::Point2f c(0.0F, 0.0F);
-    for (const cv::Point2f& p : d.corners) {
-        c += p;
-    }
-    return c * 0.25F;
-}
+}//计算模长
 
 // 将四个角点按“左上 -> 右上 -> 右下 -> 左下”顺时针排序。
-// 用绕质心的极角排序，对任意 roll 倾斜角都稳健，不再要求倾斜 ≤45°。
+// 适用于相对竖直方向倾斜不超过 45° 的四边形。
 void orderCornersClockwise(std::array<cv::Point2f, 4>& corners) {
-    cv::Point2f center(0.0F, 0.0F);
-    for (const cv::Point2f& p : corners) {
-        center += p;
+    std::sort(corners.begin(), corners.end(), [](const cv::Point2f& a,
+                                                 const cv::Point2f& b) {
+        return (a.y + a.x) < (b.y + b.x);
+    });
+    // corners[0] = 左上，corners[3] = 右下。
+    // 剩余两点用 (y - x) 区分右上（最小）和左下（最大）。
+    if (corners[1].y - corners[1].x > corners[2].y - corners[2].x) {
+        std::swap(corners[1], corners[2]);
     }
-    center *= 0.25F;
-
-    // 图像坐标 y 向下，atan2 角度递增方向即顺时针方向，得到凸四边形环序。
-    std::sort(corners.begin(), corners.end(),
-              [&center](const cv::Point2f& a, const cv::Point2f& b) {
-                  return std::atan2(a.y - center.y, a.x - center.x) <
-                         std::atan2(b.y - center.y, b.x - center.x);
-              });
-
-    // 以“左上”角（x+y 最小）为起点，其余沿顺时针环序跟随。
-    const auto top_left = std::min_element(
-        corners.begin(), corners.end(), [](const cv::Point2f& a, const cv::Point2f& b) {
-            return (a.x + a.y) < (b.x + b.y);
-        });
-    std::rotate(corners.begin(), top_left, corners.end());
+    // 此时顺序为 [左上, 右上, 左下, 右下]，交换后两元素得到顺时针顺序。
+    std::swap(corners[2], corners[3]);
 }
 
 }  // namespace
@@ -113,6 +90,17 @@ cv::Mat ArmorDetector::buildMask(const cv::Mat& bgr, TeamColor enemy_color) cons
 
     // BGR 通道差掩膜：敌色通道明显强于对侧通道，与绝对亮度无关，
     // 对较暗/较远的灯条同样鲁棒（红：R-B，蓝：B-R）。
+    /*channel_diff：输入单通道图像（比如 R - B 的差值图）。
+
+diff_mask：输出二值图。
+
+40：阈值。
+
+255：最大值。
+
+THRESH_BINARY：二值化模式。
+
+效果：遍历 channel_diff 的所有像素，如果像素值 大于 40，就在 diff_mask 对应位置设为 255；如果 小于等于 40，设为 0。用来把颜色差异明显的区域抠出来*/
     std::vector<cv::Mat> bgr_channels;
     cv::split(bgr, bgr_channels);
     cv::Mat channel_diff;
@@ -124,15 +112,13 @@ cv::Mat ArmorDetector::buildMask(const cv::Mat& bgr, TeamColor enemy_color) cons
     cv::Mat diff_mask;
     cv::threshold(channel_diff, diff_mask, kChannelDiffMin, 255, cv::THRESH_BINARY);
 
-    cv::Mat mask = color_mask & diff_mask;
+    cv::Mat mask = color_mask & diff_mask;//掩膜取交集
 
     // 开运算去噪，闭运算填充灯条内部的过曝亮斑造成的空洞。
     cv::Mat kernel_open = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    // 各向同性方形核：灯条是一排 LED，LED 间有几像素暗缝，相机滚转使灯条在
-    // 画面里倾斜时，这些暗缝方向也随之倾斜，竖直细长核（3x15）桥接不到、
-    // 灯条被切成一堆短碎片被 min_length 砍掉。方形核任意方向都能桥接 LED 暗缝；
-    // 左右两根灯条中心距在有效距离内都远大于 9px，不会把两根粘成一体。
-    cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9, 9));
+    // 竖直细长核：沿灯条方向（竖直）闭运算，桥接灯条内部因过曝/过暗造成的
+    // 竖向断口，同时几乎不横向扩展，避免把左右两根灯条粘成一体。
+    cv::Mat kernel_close = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 15));
     cv::morphologyEx(mask, mask, cv::MORPH_OPEN, kernel_open);
     cv::morphologyEx(mask, mask, cv::MORPH_CLOSE, kernel_close);
     return mask;
@@ -161,29 +147,31 @@ std::vector<ArmorDetector::LightBar> ArmorDetector::extractLightBars(
             continue;
         }
 
-        // 主轴方向用轮廓二阶中心矩（PCA）估计，比 fitLine / minAreaRect 对
-        // 轮廓边界噪声与单侧 bloom 更稳，避免侧对时近端灯条主轴被带歪。
-        const cv::Moments m = cv::moments(contour);
-        if (m.m00 < 1e-6) {
+        // 用直线拟合主轴，再投影轮廓点求端点，比 minAreaRect 更稳定。
+        cv::Vec4f line;
+        cv::fitLine(contour, line, cv::DIST_L2, 0, 0.01, 0.01);//cv::fitLine：最小二乘直线拟合。给一堆点，返回最贴合它们的一条直线。返回 cv::Vec4f = (vx, vy, x0, y0)：方向 + 一点。
+        float vx = line[0];
+        float vy = line[1];
+        const float norm = std::sqrt(vx * vx + vy * vy);
+        if (norm < 1e-6F) {
             continue;
         }
-        const double angle = 0.5 * std::atan2(2.0 * m.mu11, m.mu20 - m.mu02);
-        float vx = static_cast<float>(std::cos(angle));
-        float vy = static_cast<float>(std::sin(angle));
+        vx /= norm;
+        vy /= norm;
         // 让方向指向下方（vy >= 0），使倾角落在 [-90, 90] 而非接近 ±180。
         if (vy < 0.0F) {
             vx = -vx;
             vy = -vy;
         }
 
-        const float x0 = static_cast<float>(m.m10 / m.m00);
-        const float y0 = static_cast<float>(m.m01 / m.m00);
+        const float x0 = line[2];
+        const float y0 = line[3];
         float t_min = std::numeric_limits<float>::max();
         float t_max = -std::numeric_limits<float>::max();
         for (const auto& p : contour) {
             const float t = (p.x - x0) * vx + (p.y - y0) * vy;
             t_min = std::min(t_min, t);
-            t_max = std::max(t_max, t);
+            t_max = std::max(t_max, t);//最远两者为端点，算长度
         }
 
         // 晕光裁剪：近端过曝 LED 的 bloom 会沿主轴向外拖尾，把灯条长度撑大。
@@ -246,7 +234,7 @@ std::vector<ArmorDetector::LightBar> ArmorDetector::extractLightBars(
         cv::Point2f p_bottom(x0 + t_max * vx, y0 + t_max * vy);
         if (p_top.y > p_bottom.y) {
             std::swap(p_top, p_bottom);
-        }
+        }//找角点
         bar.top = p_top;
         bar.bottom = p_bottom;
         bar.center = cv::Point2f((p_top.x + p_bottom.x) * 0.5F,
@@ -312,9 +300,7 @@ bool ArmorDetector::classifyCenter(const cv::Mat& bgr, ArmorDetection& detection
 
     float confidence = 0.0F;
     const int number = classifier_->classify(warped(roi), confidence);
-    // 有效编号扩到 1..9：1..5 是装甲板，6/7/8/9 是前哨/哨兵/基地/负样本，
-    // 都作为已识别目标如实填写编号；只有未识别或低置信度才返回 false。
-    if (number < 1 || number > 9 || confidence < kMinNumberConfidence) {
+    if (number < 1 || number > 5 || confidence < kMinNumberConfidence) {
         return false;
     }
     detection.target_id = number;
@@ -323,22 +309,25 @@ bool ArmorDetector::classifyCenter(const cv::Mat& bgr, ArmorDetection& detection
 }
 
 std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
-                                                  TeamColor enemy_color) {
+                                                  TeamColor enemy_color) const {
     std::vector<ArmorDetection> results;
     if (bgr.empty()) {
         return results;
     }
 
+
+//准备完成，正式开始
+
+
+
     const cv::Mat mask = buildMask(bgr, enemy_color);
     const cv::Mat strength = buildStrength(bgr);
     std::vector<LightBar> bars = extractLightBars(mask, strength);
-
     if (bars.size() < 2) {
         return results;
     }
 
-    // 第一步：先框出目标。仅用几何信息两两匹配生成候选框，再打分做非极大抑制。
-    // 分类不再参与候选生成，避免“灯条识别得了但贴纸分类失败就把框丢掉”的问题。
+    // 两两匹配并打分，用于简单的非极大抑制。
     struct Candidate {
         ArmorDetection detection;
         double score;
@@ -368,7 +357,7 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
             if (axis_len < 1e-3F) {
                 continue;
             }
-            axis.x /= axis_len;
+            axis.x /= axis_len;//得到单位向量
             axis.y /= axis_len;
             const cv::Point2f center_vec = b.center - a.center;
             // 沿灯条方向的分量：两灯条应近乎等高（越小越好）。
@@ -387,17 +376,23 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
             }
 
             ArmorDetection detection;
-            buildDetection(a, b, detection);
+            buildDetection(a, b, detection);//把左右灯条的角点和装甲板大小信息存入detection
+            const bool classified = classifyCenter(bgr, detection);
 
-            // 分数：越接近标准装甲板宽高比、灯条越等长、倾角越一致、等高越准越好。
+            // 有分类器时只有有效编号才算目标；无分类器时保留候选但编号未知。
+            if (classifier_ != nullptr && classifier_->loaded() && !classified) {
+                continue;
+            }
+
+            // 分数：越接近标准装甲板宽高比、灯条越等长、倾角越一致越好。
             const double score =
                 -(std::abs(pair_ratio - 2.4) + std::abs(length_ratio - 1.0) +
-                  angle_diff / 10.0 + along_offset);
+                  angle_diff / 10.0);
             candidates.push_back({detection, score, static_cast<int>(i),
                                   static_cast<int>(j)});
         }
     }
-
+//根据分数排序
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& lhs, const Candidate& rhs) {
                   return lhs.score > rhs.score;
@@ -413,51 +408,5 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
         used[candidate.right] = true;
         results.push_back(candidate.detection);
     }
-
-    // 第二步：对已框出的目标识别中央贴纸，填写编号/置信度。
-    // 识别失败不丢弃框：保留框但 target_id 保持 0（未知目标）。
-    for (ArmorDetection& detection : results) {
-        classifyCenter(bgr, detection);
-    }
-
-    // 第三步：时间平滑。角点直接取自灯条端点，逐帧有 2~5px 噪声，用 EMA 与上一帧
-    // 同目标角点混合，消除“框位置对但四角跳”。只在检测到目标时平滑；检测丢失
-    // 立即清空 prev_boxes_，绝不保留残影。
-    for (ArmorDetection& det : results) {
-        int best = -1;
-        float best_d = kAssocDistPx;
-        const cv::Point2f center = boxCenter(det);
-        for (std::size_t k = 0; k < prev_boxes_.size(); ++k) {
-            const float d =
-                static_cast<float>(cv::norm(boxCenter(prev_boxes_[k]) - center));
-            if (d < best_d) {
-                best_d = d;
-                best = static_cast<int>(k);
-            }
-        }
-        if (best < 0) {
-            continue;  // 无上一帧同目标：本帧直接用原始角点。
-        }
-        const std::array<cv::Point2f, 4> prev_corners = prev_boxes_[best].corners;
-        for (int i = 0; i < 4; ++i) {
-            // 按最近角点（而非序号）匹配，避免角点序号翻转导致框扭曲。
-            int bi = 0;
-            float bd = std::numeric_limits<float>::max();
-            for (int j = 0; j < 4; ++j) {
-                const float d =
-                    static_cast<float>(cv::norm(det.corners[i] - prev_corners[j]));
-                if (d < bd) {
-                    bd = d;
-                    bi = j;
-                }
-            }
-            det.corners[i].x = kSmoothAlpha * det.corners[i].x +
-                               (1.0F - kSmoothAlpha) * prev_corners[bi].x;
-            det.corners[i].y = kSmoothAlpha * det.corners[i].y +
-                               (1.0F - kSmoothAlpha) * prev_corners[bi].y;
-        }
-    }
-    prev_boxes_ = results;
-
     return results;
 }
