@@ -19,17 +19,20 @@ constexpr int kRedHueLow2 = 156;
 constexpr int kRedHueHigh2 = 180;
 constexpr int kBlueHueLow = 100;
 constexpr int kBlueHueHigh = 124;
-constexpr int kColorSaturationMin = 80;
+// 侧对时 LED 发光方向性强、亮度掉得厉害，饱和度和通道差阈值若太高会把偏离
+// 正对较远的灯条直接滤掉，导致可测角度窗口过窄。放低这两项以扩大可测角度
+// （样本更多 -> ω 收敛更快），代价是更容易误检，靠后面的配对 + PnP 重投影兜底。
+constexpr int kColorSaturationMin = 55;
 constexpr int kColorValueMin = 20;
 // ---- BGR 通道差掩膜阈值 ----
-constexpr int kChannelDiffMin = 32;
+constexpr int kChannelDiffMin = 20;
 
 // ---- 灯条候选过滤 ----
 constexpr double kMinLengthRatio = 0.03;   // 相对图像高度（1080p≈32px，放开识别距离）
 constexpr double kMinAspectRatio = 1.5;    // 长度/宽度（侧对时灯条变胖，放宽）
 constexpr double kMaxAngleDeg = 60.0;      // 相对竖直方向：允许装甲板绕中心 roll 到 60°
 constexpr double kMinFillRatio = 0.35;     // 轮廓面积 / 外接矩形面积
-constexpr double kMinBarArea = 40.0;       // 侧对时灯条变窄，放宽最小面积
+constexpr double kMinBarArea = 25.0;       // 侧对时灯条变窄变暗，进一步放宽最小面积
 // 灯条端点晕光裁剪：沿主轴采样颜色强度，强度低于该灯条峰值强度的
 // 该比例处视为 bloom 边界。近端饱和 LED 的 bloom 更亮、更拖尾，
 // 用绝对阈值会把远端真灯条一起误伤，故按每根灯条自身峰值做相对裁剪。
@@ -38,16 +41,23 @@ constexpr double kBarTrimStrengthRatio = 0.6;
 // ---- 左右灯条匹配 ----
 // 配对条件整体收紧：多灯条场景下避免把不同装甲板的灯条错配成一块，
 // 只在几何上足够吻合时才生成候选框。
-constexpr double kMaxLengthRatio = 1.6;      // 长度比：同板两灯条长度应接近
-constexpr double kMaxAngleDiffDeg = 12.0;    // 角度差：两灯条应近乎平行
+constexpr double kMaxLengthRatio = 1.35;     // 长度比：同板两灯条长度应接近
+constexpr double kMaxAngleDiffDeg = 10.0;    // 角度差：两灯条应近乎平行
 // 中心距/平均长度。下限放开到 0.6：侧对时两灯条在图像上靠得更近，0.6 对应约
 // 75° 侧对角度；再低（0.4~0.5）只多换 3~5°，却让不同装甲板灯条错配风险陡增，
-// 反而伤精度，故停在 0.6。上限收到 4.5（大装甲 230/57≈4.04），避免相邻板错配。
+// 反而伤精度，故停在 0.6。上限放宽到 6.0：标准大装甲 230/57≈4.04，但暗场景下
+// 灯条 bloom 裁剪会把实测长度裁短、抬高比值到 ~4.5~5.5（v4 实测大量帧落在
+// 4.42~5.0 被旧阈值 4.5 误拒）；而真正错配的「异板/异物远对」比值都在 15 以上，
+// 6.0 与 15 之间留了足够间隙，不会把错配放进来。
 constexpr double kMinPairWidthRatio = 0.6;
-constexpr double kMaxPairWidthRatio = 4.5;
-constexpr double kMaxAlongAxisOffsetRatio = 0.35; // 中心沿灯条主轴偏移/平均长度
+constexpr double kMaxPairWidthRatio = 6.0;
+constexpr double kMaxAlongAxisOffsetRatio = 0.30; // 中心沿灯条主轴偏移/平均长度
 // 大小装甲板分界：中心距/灯条长度（小 135/57≈2.37，大 230/57≈4.04）。
 constexpr double kLargeArmorRatio = 3.0;// 取中间值，避免小装甲板被误判为大装甲板。
+// 标准宽长比（仅用于配对打分，不做硬门槛）：打分同时接纳两种尺寸，
+// 避免大装甲板（≈4.04）被固定 2.4 的目标误扣分，在贪心匹配里输给错配的候选对。
+constexpr double kSmallArmorStdRatio = 135.0 / 57.0;  // ≈2.37
+constexpr double kLargeArmorStdRatio = 230.0 / 57.0;  // ≈4.04
 
 // ---- 数字分类 ----
 constexpr float kMinNumberConfidence = 0.5F;//图像贴纸与数据集相似度底线
@@ -55,6 +65,10 @@ constexpr float kMinNumberConfidence = 0.5F;//图像贴纸与数据集相似度�
 // ---- 时间平滑（EMA）----
 constexpr float kSmoothAlpha = 0.6F;   // 当前帧权重；上一帧权重 = 1 - alpha
 constexpr float kAssocDistPx = 60.0F;  // 相邻帧同目标关联的最大中心位移（像素）
+// 漏检保持帧数：166fps 下目标 6ms 内几乎不动，单帧/双帧漏检大多是阈值边缘抖动而非
+// 目标真的出画。保持上一帧框最多 5 帧（~30ms），把这种闪灭抹平；真正出画（长间隔）
+// 超过此上限后清空，不留残影。
+constexpr int kMaxHoldFrames = 5;
 
 double dist(const cv::Point2f& a, const cv::Point2f& b) {
     return cv::norm(a - b);
@@ -327,8 +341,9 @@ bool ArmorDetector::classifyCenter(const cv::Mat& bgr, ArmorDetection& detection
 std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
                                                   TeamColor enemy_color) {
     std::vector<ArmorDetection> results;
+    last_pair_diag_ = {};
     if (bgr.empty()) {
-        return results;
+        return holdOrClear();
     }
 
     const cv::Mat mask = buildMask(bgr, enemy_color);
@@ -337,7 +352,7 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
     last_bars_ = bars;
 
     if (bars.size() < 2) {
-        return results;
+        return holdOrClear();
     }
 
     // 第一步：先框出目标。仅用几何信息两两匹配生成候选框，再打分做非极大抑制。
@@ -349,6 +364,9 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
         int right;
     };
     std::vector<Candidate> candidates;
+
+    PairDiagnostic pair_diag;
+    double best_perp = -1.0;
 
     for (std::size_t i = 0; i < bars.size(); ++i) {
         for (std::size_t j = i + 1; j < bars.size(); ++j) {
@@ -383,9 +401,22 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
             const double pair_ratio = perp_axis / avg_length;
             const double along_offset = along_axis / avg_length;
 
-            if (length_ratio > kMaxLengthRatio || angle_diff > kMaxAngleDiffDeg ||
+            // 记录「最宽灯条对」：即使被拒也记录，便于可视化定位是哪个门槛把框卡掉。
+            const bool reject =
+                length_ratio > kMaxLengthRatio || angle_diff > kMaxAngleDiffDeg ||
                 pair_ratio < kMinPairWidthRatio || pair_ratio > kMaxPairWidthRatio ||
-                along_offset > kMaxAlongAxisOffsetRatio) {
+                along_offset > kMaxAlongAxisOffsetRatio;
+            if (perp_axis > best_perp) {
+                best_perp = perp_axis;
+                pair_diag.valid = true;
+                pair_diag.pair_ratio = pair_ratio;
+                pair_diag.length_ratio = length_ratio;
+                pair_diag.angle_diff = angle_diff;
+                pair_diag.along_offset = along_offset;
+                pair_diag.rejected = reject;
+            }
+
+            if (reject) {
                 continue;
             }
 
@@ -393,13 +424,20 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
             buildDetection(a, b, detection);
 
             // 分数：越接近标准装甲板宽高比、灯条越等长、倾角越一致、等高越准越好。
+            // 宽高比取「到小/大装甲标准值的最小距离」，让两种尺寸都能拿到高分，
+            // 否则固定 2.4 会让大装甲板（≈4.04）被错配候选对挤掉。
+            const double ratio_error =
+                std::min(std::abs(pair_ratio - kSmallArmorStdRatio),
+                         std::abs(pair_ratio - kLargeArmorStdRatio));
             const double score =
-                -(std::abs(pair_ratio - 2.4) + std::abs(length_ratio - 1.0) +
+                -(ratio_error + std::abs(length_ratio - 1.0) +
                   angle_diff / 10.0 + along_offset);
             candidates.push_back({detection, score, static_cast<int>(i),
                                   static_cast<int>(j)});
         }
     }
+
+    last_pair_diag_ = pair_diag;
 
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& lhs, const Candidate& rhs) {
@@ -415,6 +453,11 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
         used[candidate.left] = true;
         used[candidate.right] = true;
         results.push_back(candidate.detection);
+    }
+
+    // 灯条够多但没配出任何有效框：同样走保持逻辑，避免单帧配对失败导致框闪灭。
+    if (results.empty()) {
+        return holdOrClear();
     }
 
     // 第二步：对已框出的目标识别中央贴纸，填写编号/置信度。
@@ -441,6 +484,14 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
         if (best < 0) {
             continue;  // 无上一帧同目标：本帧直接用原始角点。
         }
+        // 大小装甲板粘滞：板尺寸是恒定物理属性，而「中心距/灯条长」比例会随偏航角
+        // 透视缩短、只会变小不会变大。所以上一帧已判为大装甲板（比例>3.0）的板，本帧
+        // 因侧对角度增大、比例跌到阈值下被判成小，属于误判——沿用大板，避免 PnP 用错
+        // 物点宽度（0.135 vs 0.230 m）导致深度 1.7 倍跳变。该跳变会让多车关联把同一
+        // 辆车的板误拆成第二辆车（俯视图越开越多、编号乱）。
+        if (prev_boxes_[best].size == ArmorSize::Large) {
+            det.size = ArmorSize::Large;
+        }
         const std::array<cv::Point2f, 4> prev_corners = prev_boxes_[best].corners;
         for (int i = 0; i < 4; ++i) {
             // 按最近角点（而非序号）匹配，避免角点序号翻转导致框扭曲。
@@ -461,6 +512,23 @@ std::vector<ArmorDetection> ArmorDetector::detect(const cv::Mat& bgr,
         }
     }
     prev_boxes_ = results;
+    hold_frames_ = 0;
 
     return results;
+}
+
+std::vector<ArmorDetection> ArmorDetector::holdOrClear() {
+    // 上一帧有框且保持未超限：沿用上一帧框，标记 held，供下游（可视化/EKF）区分
+    // 这是「保持帧」而非新检测；超限后清空，避免目标出画后仍留残影。
+    if (!prev_boxes_.empty() && hold_frames_ < kMaxHoldFrames) {
+        std::vector<ArmorDetection> held = prev_boxes_;
+        for (ArmorDetection& d : held) {
+            d.held = true;
+        }
+        ++hold_frames_;
+        return held;
+    }
+    prev_boxes_.clear();
+    hold_frames_ = 0;
+    return {};
 }

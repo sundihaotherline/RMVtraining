@@ -47,15 +47,18 @@ add_library(training_core STATIC
     student/src/ArmorDetector.cpp
     student/src/NumberClassifier.cpp
     student/src/CameraStream.cpp
+    student/src/MultiVehicleTracker.cpp
+    student/src/RotatingVehicleTracker.cpp
 )
 target_include_directories(training_core
     PUBLIC
         include
         student/include
         serialPort/include
+        armor/include
         ${OpenCV_INCLUDE_DIRS}
 )
-target_link_libraries(training_core PUBLIC serialPort ${OpenCV_LIBS})
+target_link_libraries(training_core PUBLIC serialPort ${OpenCV_LIBS} algorithm_support Eigen3::Eigen)
 if(HAS_MVS_SDK)
     target_include_directories(training_core PRIVATE ${MVS_INCLUDE_DIR})
     target_compile_definitions(training_core PRIVATE HAS_MVS_SDK)

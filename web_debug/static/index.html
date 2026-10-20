@@ -241,6 +241,48 @@
         .empty-title { color: var(--text); font-size: 15px; font-weight: 650; }
         .empty-detail { margin-top: 6px; font-size: 12px; }
 
+        /* 角速度专用小窗：固定在面板顶部，把测量 ω 与 EKF ω 叠在一张图里对照。 */
+        #omegaSection { margin-bottom: 12px; }
+
+        #omegaCard { width: 100%; }
+
+        .omega-readout {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 28px;
+            padding: 8px 12px;
+            border-bottom: 1px solid var(--line);
+        }
+
+        .omega-readout .item {
+            display: inline-flex;
+            align-items: baseline;
+            gap: 8px;
+        }
+
+        .omega-readout .dot {
+            align-self: center;
+            width: 9px;
+            height: 9px;
+            border-radius: 50%;
+        }
+
+        .omega-readout .label { color: var(--muted); font-size: 12px; }
+
+        .omega-readout .num {
+            font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+            font-size: 20px;
+            font-weight: 800;
+            font-variant-numeric: tabular-nums;
+            letter-spacing: -0.2px;
+        }
+
+        .omega-wrap { height: 300px; }
+
+        #omegaCard.collapsed .chart-wrap,
+        #omegaCard.collapsed .omega-readout { display: none; }
+        #omegaCard.collapsed .chart-header { border-bottom: 0; }
+
         @media (max-width: 850px) {
             .topbar { align-items: flex-start; flex-wrap: wrap; }
             .connection { margin-left: auto; }
@@ -289,6 +331,38 @@
     </header>
 
     <main>
+        <section id="omegaSection" aria-live="polite">
+            <article id="omegaCard" class="chart-card">
+                <header class="chart-header">
+                    <div class="metric-info">
+                        <span class="metric-name" title="角速度 ω（测量 vs EKF）">角速度 ω（测量 vs EKF）· deg/s</span>
+                    </div>
+                    <div class="card-actions">
+                        <button id="omegaExportButton" type="button" class="icon-btn"
+                            title="导出角速度 CSV" aria-label="导出角速度 CSV">CSV</button>
+                        <button id="omegaCollapseButton" type="button" class="icon-btn"
+                            title="折叠角速度小窗" aria-label="折叠角速度小窗"
+                            aria-expanded="true">v</button>
+                    </div>
+                </header>
+                <div class="omega-readout">
+                    <span class="item">
+                        <span class="dot" style="background: #e3ad4a" aria-hidden="true"></span>
+                        <span class="label">测量 ω</span>
+                        <span class="num" id="omegaMeasNum">-</span>
+                    </span>
+                    <span class="item">
+                        <span class="dot" style="background: #45c4b0" aria-hidden="true"></span>
+                        <span class="label">EKF ω</span>
+                        <span class="num" id="omegaEkfNum">-</span>
+                    </span>
+                </div>
+                <div class="chart-wrap omega-wrap">
+                    <canvas id="omegaCanvas" role="img" aria-label="角速度曲线"></canvas>
+                </div>
+            </article>
+        </section>
+
         <section id="charts" aria-live="polite"></section>
     </main>
 
@@ -310,6 +384,23 @@
             let paused = false;
             let streamState = "connecting";
             let eventSource = null;
+
+            // 角速度专用小窗：把测量 ω 与 EKF ω 两条曲线叠在一张图里（deg/s），
+            // 数据来自 webdebug 已上报的 meas_yaw_rate_rad_s / ekf_yaw_rate_rad_s。
+            const OMEGA_MEAS_KEY = "meas_yaw_rate_rad_s";
+            const OMEGA_EKF_KEY = "ekf_yaw_rate_rad_s";
+            const RAD_TO_DEG = 180 / Math.PI;
+            const omegaCard = document.getElementById("omegaCard");
+            const omegaCanvas = document.getElementById("omegaCanvas");
+            const omegaMeasNum = document.getElementById("omegaMeasNum");
+            const omegaEkfNum = document.getElementById("omegaEkfNum");
+            const omegaExportButton = document.getElementById("omegaExportButton");
+            const omegaCollapseButton = document.getElementById("omegaCollapseButton");
+            const omegaSeries = {
+                meas: { history: [], color: "#e3ad4a" },
+                ekf: { history: [], color: "#45c4b0" }
+            };
+            let omegaDirty = true;
 
             function setConnectionState(state, label) {
                 streamState = state;
@@ -430,6 +521,16 @@
                     chart.history.splice(0, chart.history.length - MAX_HISTORY_POINTS);
                 }
                 chart.dirty = true;
+
+                if (point.k === OMEGA_MEAS_KEY || point.k === OMEGA_EKF_KEY) {
+                    const which = point.k === OMEGA_MEAS_KEY ? "meas" : "ekf";
+                    omegaSeries[which].history.push({ t: timestamp, v: numericValue });
+                    if (omegaSeries[which].history.length > MAX_HISTORY_POINTS) {
+                        omegaSeries[which].history.splice(
+                            0, omegaSeries[which].history.length - MAX_HISTORY_POINTS);
+                    }
+                    omegaDirty = true;
+                }
             }
 
             function visiblePoints(history) {
@@ -533,9 +634,133 @@
                 ctx.stroke();
             }
 
+            function visibleOmegaPoints(history) {
+                if (history.length === 0) return history;
+                const seconds = Number(timeWindow.value);
+                if (seconds === 0) return history;
+                const cutoff = history[history.length - 1].t - seconds * 1000;
+                let first = history.length - 1;
+                while (first > 0 && history[first - 1].t >= cutoff) first -= 1;
+                return history.slice(first);
+            }
+
+            function formatDegPerSec(radPerSec) {
+                const deg = radPerSec * RAD_TO_DEG;
+                const sign = deg >= 0 ? "+" : "";
+                return `${sign}${deg.toFixed(1)}`;
+            }
+
+            function strokeOmegaSeries(ctx, points, color, tMin, tSpan, vMin, vMax, plot) {
+                if (points.length === 0) return;
+                const plotWidth = plot.right - plot.left;
+                const plotHeight = plot.bottom - plot.top;
+                const maxRenderedPoints = Math.max(100, Math.floor(plotWidth * 2));
+                const step = Math.max(1, Math.ceil(points.length / maxRenderedPoints));
+                ctx.beginPath();
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 1.8;
+                let started = false;
+                for (let i = 0; i < points.length; i += step) {
+                    const p = points[i];
+                    const x = plot.left + ((p.t - tMin) / tSpan) * plotWidth;
+                    const deg = p.v * RAD_TO_DEG;
+                    const y = plot.bottom - ((deg - vMin) / (vMax - vMin)) * plotHeight;
+                    if (!started) { ctx.moveTo(x, y); started = true; }
+                    else ctx.lineTo(x, y);
+                }
+                const lastP = points[points.length - 1];
+                const lastDeg = lastP.v * RAD_TO_DEG;
+                const lastX = plot.left + ((lastP.t - tMin) / tSpan) * plotWidth;
+                const lastY = plot.bottom - ((lastDeg - vMin) / (vMax - vMin)) * plotHeight;
+                ctx.lineTo(lastX, lastY);
+                ctx.stroke();
+            }
+
+            function renderOmega(force) {
+                if (force) omegaDirty = true;
+                if (!omegaDirty) return;
+                omegaDirty = false;
+
+                const meas = visibleOmegaPoints(omegaSeries.meas.history);
+                const ekf = visibleOmegaPoints(omegaSeries.ekf.history);
+                if (meas.length > 0) {
+                    omegaMeasNum.textContent = formatDegPerSec(meas[meas.length - 1].v);
+                }
+                if (ekf.length > 0) {
+                    omegaEkfNum.textContent = formatDegPerSec(ekf[ekf.length - 1].v);
+                }
+
+                const rect = omegaCanvas.getBoundingClientRect();
+                if (rect.width < 10 || rect.height < 10) return;
+                const ratio = Math.min(window.devicePixelRatio || 1, 2);
+                omegaCanvas.width = Math.round(rect.width * ratio);
+                omegaCanvas.height = Math.round(rect.height * ratio);
+                const ctx = omegaCanvas.getContext("2d");
+                ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+                ctx.clearRect(0, 0, rect.width, rect.height);
+
+                if (meas.length === 0 && ekf.length === 0) {
+                    ctx.fillStyle = "#9ba7ad";
+                    ctx.font = "12px system-ui, sans-serif";
+                    ctx.textAlign = "center";
+                    ctx.fillText("暂无角速度数据", rect.width / 2, rect.height / 2);
+                    return;
+                }
+
+                const all = meas.concat(ekf);
+                let tMin = Infinity, tMax = -Infinity, vMin = Infinity, vMax = -Infinity;
+                for (const p of all) {
+                    const deg = p.v * RAD_TO_DEG;
+                    if (p.t < tMin) tMin = p.t;
+                    if (p.t > tMax) tMax = p.t;
+                    if (deg < vMin) vMin = deg;
+                    if (deg > vMax) vMax = deg;
+                }
+                // 零点必在视野内，转动的正负方向一眼可见。
+                vMin = Math.min(vMin, 0);
+                vMax = Math.max(vMax, 0);
+                const tSpan = Math.max(1, tMax - tMin);
+                const spread = vMax - vMin;
+                const pad = spread === 0 ? Math.max(Math.abs(vMax) * 0.08, 20) : spread * 0.1;
+                vMin -= pad;
+                vMax += pad;
+
+                const plot = { left: 58, top: 12, right: rect.width - 12, bottom: rect.height - 28 };
+                const plotWidth = Math.max(1, plot.right - plot.left);
+                const plotHeight = Math.max(1, plot.bottom - plot.top);
+
+                ctx.font = "11px system-ui, sans-serif";
+                for (let line = 0; line <= 4; line += 1) {
+                    const y = plot.top + (plotHeight * line) / 4;
+                    const value = vMax - ((vMax - vMin) * line) / 4;
+                    const isZero = Math.abs(value) < (vMax - vMin) * 0.005;
+                    ctx.strokeStyle = isZero ? "#66747c" : "#293136";
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(plot.left, Math.round(y) + 0.5);
+                    ctx.lineTo(plot.right, Math.round(y) + 0.5);
+                    ctx.stroke();
+                    ctx.fillStyle = "#9ba7ad";
+                    ctx.textAlign = "right";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText(formatValue(value), plot.left - 7, y);
+                }
+
+                ctx.textBaseline = "alphabetic";
+                ctx.fillStyle = "#9ba7ad";
+                ctx.textAlign = "left";
+                ctx.fillText(new Date(tMin).toLocaleTimeString(), plot.left, rect.height - 7);
+                ctx.textAlign = "right";
+                ctx.fillText(new Date(tMax).toLocaleTimeString(), plot.right, rect.height - 7);
+
+                strokeOmegaSeries(ctx, meas, omegaSeries.meas.color, tMin, tSpan, vMin, vMax, plot);
+                strokeOmegaSeries(ctx, ekf, omegaSeries.ekf.color, tMin, tSpan, vMin, vMax, plot);
+            }
+
             function renderAll(force = false) {
                 if (paused && !force) return;
                 for (const chart of charts.values()) renderChart(chart);
+                renderOmega(force);
             }
 
             function csvCell(value) {
@@ -592,10 +817,37 @@
             clearButton.addEventListener("click", () => {
                 charts.clear();
                 chartsRoot.replaceChildren();
+                omegaSeries.meas.history.length = 0;
+                omegaSeries.ekf.history.length = 0;
+                omegaMeasNum.textContent = "-";
+                omegaEkfNum.textContent = "-";
+                omegaDirty = true;
+                renderOmega(true);
                 updateEmptyState();
             });
 
             exportButton.addEventListener("click", exportAll);
+
+            function exportOmega() {
+                const rows = ["series,timestamp,time,value_rad_s,value_deg_s"];
+                for (const [name, series] of [["meas", omegaSeries.meas], ["ekf", omegaSeries.ekf]]) {
+                    for (const p of series.history) {
+                        rows.push(`${name},${p.t},${csvCell(new Date(p.t).toISOString())},${p.v},${p.v * RAD_TO_DEG}`);
+                    }
+                }
+                triggerDownload("omega.csv", rows);
+            }
+
+            omegaExportButton.addEventListener("click", exportOmega);
+            omegaCollapseButton.addEventListener("click", () => {
+                const collapsed = omegaCard.classList.toggle("collapsed");
+                omegaCollapseButton.textContent = collapsed ? ">" : "v";
+                omegaCollapseButton.title = collapsed ? "展开角速度小窗" : "折叠角速度小窗";
+                omegaCollapseButton.setAttribute("aria-label", omegaCollapseButton.title);
+                omegaCollapseButton.setAttribute("aria-expanded", String(!collapsed));
+                if (!collapsed) { omegaDirty = true; renderOmega(true); }
+            });
+
             timeWindow.addEventListener("change", () => {
                 for (const chart of charts.values()) chart.dirty = true;
                 renderAll(true);
