@@ -44,7 +44,7 @@ constexpr double kRPosition = 1e-3;   // (m²)     观测位置噪声（约 3 cm
 constexpr double kRYawObs = 2e-2;     // (rad²)   yaw 直接观测噪声基准（板朝向，侧对时约 8°）
 constexpr double kYawSlantGain = 100.0;  // 板正对相机时 PnP 绕法向旋转病态，yaw/ω 观测噪声按 |cos(法向-视线)|² 放大
 constexpr double kRWObs = 4.0;        // (rad/s)² ω 直接观测噪声基准（侧对、30fps 时朝向差分+EMA 后约 σ≈2 rad/s）
-constexpr double kNominalDtS = 0.033;    // 基准帧间隔（~30fps），ω 观测噪声随帧率按 (dt0/dt)² 反比放大
+constexpr double kNominalDtS = 0.006;    // 基准帧间隔（~30fps），ω 观测噪声随帧率按 (dt0/dt)² 反比放大
 constexpr double kMinMeasDtS = 0.005;   // ω 差分最小帧间隔：低于此说明时间戳抖动，d/dt 爆炸成假 ω，跳过
 constexpr double kMaxMeasWInst = 20.0;  // 瞬时 ω 限幅（rad/s，约 1146°/s，~3 圈/秒），挡差分爆炸尖峰
 constexpr double kMaxRotationDeltaRad = 1.0;  // yaw 观测投影到先验 branch 后残差仍超过此值视为翻转/离群，丢弃（1.0 rad 仍远小于 π，翻转仍被拒）
@@ -68,14 +68,15 @@ constexpr double kRadiusHintMaxCenterVel = 0.5;     // 中心速度低于此值�
 constexpr double kRadiusHintNoiseM = 0.02;          // 半径软观测噪声（m），比位置观测紧，压过塌缩方向
 constexpr double kRadiusPriorNoiseM = 0.06;         // 平移/静止车半径弱先验噪声（m）：先验 0.2 只是猜测，放宽不硬锁定
 
-// 位置窗 ω 软观测（见 step() 的 (g) 段）：板只在正对相机时被检测到，朝向差分的 ω
-// 观测几乎恒被 slant 加权降到 0，ω 只能靠位置→θ 间接耦合估计、噪声大且随转速周期性
-// 振荡。改用「前板相对中心扫过角」的窗口累计（逐帧叉积增量，|增量|>门限判换板丢弃，
-// 总扫角/总时长 = ω）。仅旋转车注入。
-constexpr std::size_t kOmegaWindow = 166;          // 前板位置窗（帧）≈1s，覆盖整圈
+// 朝向窗 ω 软观测（见 step() 的 (g) 段）：板只在正对相机时被检测到（slant≈1），被检测
+// 板的位置几乎恒在正前方、不绕中心扫角（实测位置角 std≈10°），朝向差分的 ω 观测又几乎
+// 恒被 slant 加权降到 0，ω 只能靠位置→θ 间接耦合估计、噪声大且随转速周期性振荡。改用
+// 「前板朝向 -armor_orientation_yaw 的 wrap 增量」窗口累计（逐帧 wrapToPi 增量，
+// |增量|>门限判换板丢弃，总扫角/总时长 = ω）。仅旋转车注入。
+constexpr std::size_t kOmegaWindow = 166;          // 前板朝向窗（帧）≈1s，覆盖整圈
 constexpr std::size_t kOmegaMinSamples = 40;       // 至少这么多有效增量才注入
 constexpr double kOmegaIncGateRad = 0.5;           // 相邻帧扫角增量门限（>28°判换板/离群，丢弃）
-constexpr double kOmegaObsNoiseRadS = 1.0;         // 位置窗 ω 观测噪声（rad/s），整圈累计后 σ≈1~2
+constexpr double kOmegaObsNoiseRadS = 1.0;         // 朝向窗 ω 观测噪声（rad/s），整圈累计后 σ≈1~2
 
 // 平移/静止判定门限：|ω| 低于此值（约 23°/s）视为纯平移/静止。此时单板位置对
 // yaw 几何不可观测（中心自由时任意 yaw 都能配出零残差），朝向观测又因板正对相机
@@ -622,54 +623,56 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
             }
         }
 
-        // (g) 位置窗 ω 软观测：板只在正对相机时被检测到（slant≈1），(d)/(e) 的朝向 yaw/ω
-        // 观测因此几乎恒被 slant 加权降到 0，ω 只能靠位置→θ 的间接耦合估计，噪声大且
-        // 随转速周期性振荡。改用「前板相对中心扫过角」的窗口累计：逐帧叉积增量
-        // atan2(cross, dot)（无 atan2 奇点、绕开 ±π 翻转），|增量|>门限判换板/离群丢弃，
-        // 总扫角/总时长即干净的 ω。只对旋转车（!translation_mode_）注入：平移车前板相对
-        // 中心几乎不动、扫角≈0，注入会把 ω 锚错到 0。
+#if 1  // 【已修复】启用 (g) ω 直接观测：改用「前板朝向扫角」而非位置扫角。
+        // (g) 朝向窗 ω 软观测：板只在正对相机时被检测到（slant≈1），被检测板的位置几乎
+        // 恒在正前方（位置角 std≈10°、不绕中心扫角），真正单调扫的是板的朝向
+        // armor_orientation_yaw（可见弧内扫 ~105°）。故用朝向的 wrap 增量窗口累计：
+        // 逐帧 wrapToPi 增量，|增量|>门限判换板/离群丢弃，总扫角/总时长即干净的 ω。
+        // 不再用 translation_mode_ 门控：它会造死锁——初始化 ω=0 → |ω|<0.4 → translation_mode_=true
+        // → (g) 被跳过 → ω 永远 0，旋转车永远转不起来（正是「EKF ω 卡 0、实测 ω 读 290」）。
+        // w_fit 本身自门：静止/平移车朝向不扫、w_fit≈0（正确注入 0），旋转车朝向扫、
+        // w_fit≈真 ω（把 ω 拉起）。平移车边平移时朝向会随视线方位缓慢变化、可能注入小假 ω，
+        // 属已知代价，后续用 |V| 或扫角幅值门限单独处理。
         {
             if (!observations.empty()) {
-                const cv::Vec3d& p = observations.front().position_gimbal_m;
-                if (std::isfinite(p[0]) && std::isfinite(p[2])) {
-                    recent_front_pos_.push_back({p[0], p[2], timestamp_seconds});
+                // -armor_orientation_yaw 作车体 yaw 代理（与 (e) 段 yaw_proxy 同约定）：
+                // armor_orientation_yaw = -(θ+φ+π/2)，取负后按 +ω 方向单调扫。
+                const double ori = -observations.front().armor_orientation_yaw;
+                if (std::isfinite(ori)) {
+                    recent_front_pos_.push_back({ori, timestamp_seconds, 0.0});
                 }
             }
             while (recent_front_pos_.size() > kOmegaWindow) {
                 recent_front_pos_.pop_front();
             }
 
-            if (!translation_mode_) {
-                const double cx = ekf_->get_X()(kCx);
-                const double cz = ekf_->get_X()(kCz);
-                double total_ang = 0.0, total_dt = 0.0;
-                int cnt = 0;
-                for (std::size_t i = 1; i < recent_front_pos_.size(); ++i) {
-                    const auto& a = recent_front_pos_[i - 1];
-                    const auto& b = recent_front_pos_[i];
-                    const double ax = a[0] - cx, az = a[1] - cz;
-                    const double bx = b[0] - cx, bz = b[1] - cz;
-                    const double dt = b[2] - a[2];
-                    if (!(dt > 0.0) || dt > kMaxDtS) continue;       // 时间戳倒退/停顿
-                    const double dth = std::atan2(ax * bz - az * bx, ax * bx + az * bz);
-                    if (std::fabs(dth) > kOmegaIncGateRad) continue;  // 换板/离群（>28°）
-                    total_ang += dth;
-                    total_dt += dt;
-                    ++cnt;
-                }
-                if (cnt >= kOmegaMinSamples && total_dt > 0.0) {
-                    const double w_fit = total_ang / total_dt;
-                    Eigen::MatrixXd H_w = Eigen::MatrixXd::Zero(1, kStateDim);
-                    H_w(0, kYawRate) = 1.0;
-                    Eigen::MatrixXd R_w = Eigen::MatrixXd::Zero(1, 1);
-                    R_w(0, 0) = kOmegaObsNoiseRadS * kOmegaObsNoiseRadS;
-                    Eigen::VectorXd z_w(1);
-                    z_w(0) = w_fit;
-                    ekf_->update(z_w, H_w, R_w);
-                    ekf_->usePostAsPri();
-                }
+            double total_ang = 0.0, total_dt = 0.0;
+            int cnt = 0;
+            for (std::size_t i = 1; i < recent_front_pos_.size(); ++i) {
+                const auto& a = recent_front_pos_[i - 1];
+                const auto& b = recent_front_pos_[i];
+                const double dt = b[1] - a[1];
+                if (!(dt > 0.0) || dt > kMaxDtS) continue;       // 时间戳倒退/停顿
+                const double dth = wrapToPi(b[0] - a[0]);
+                if (std::fabs(dth) > kOmegaIncGateRad) continue;  // 换板/离群（>28°）
+                total_ang += dth;
+                total_dt += dt;
+                ++cnt;
+            }
+            if (cnt >= kOmegaMinSamples && total_dt > 0.0) {
+                const double w_fit = total_ang / total_dt;
+                Eigen::MatrixXd H_w = Eigen::MatrixXd::Zero(1, kStateDim);
+                H_w(0, kYawRate) = 1.0;
+                Eigen::MatrixXd R_w = Eigen::MatrixXd::Zero(1, 1);
+                R_w(0, 0) = kOmegaObsNoiseRadS * kOmegaObsNoiseRadS;
+                Eigen::VectorXd z_w(1);
+                z_w(0) = w_fit;
+                ekf_->update(z_w, H_w, R_w);
+                ekf_->usePostAsPri();
             }
         }
+#endif  // (g) ω 直接观测结束（朝向窗扫角软观测）
+
     }
 
     // 3. 丢失计数。

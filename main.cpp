@@ -749,7 +749,17 @@ void *OperationFunction(void *arg) {
             g_meas_omega_rad_s = 0.0;
             g_has_meas_yaw = false;
         }
-        WEB_LOG("meas_yaw_rate_rad_s", g_meas_omega_rad_s);
+        // 静止/平移时（|ω| < 0.4，与 RotatingVehicleTracker::kTranslationOmegaThresh 一致）
+        // 板正对相机，PnP 解出的法向朝向病态，原始朝向差分的 meas_w 只是噪声、正负来回
+        // 振荡，会误导观感（此时 ekf 曲线本就 ≈0，说明 EKF 是对的）。用上一帧 EKF ω 判
+        // 静止，静止时把「显示用」meas_w 归零，与 EKF 的 translation_mode_ 冻结对齐；CSV
+        // 落盘仍保留原始 g_meas_omega_rad_s，离线对照不被这层门限污染。
+        double meas_w_display = g_meas_omega_rad_s;
+        if (!g_last_predictions.empty() &&
+            std::fabs(g_last_predictions.front().body_yaw_velocity) < 0.4) {
+            meas_w_display = 0.0;
+        }
+        WEB_LOG("meas_yaw_rate_rad_s", meas_w_display);
 
         // [离线调试] 实时框选可视化，ESC 退出。按 ~30fps 节流刷新窗口，
         // 其余帧跳过 imshow/重绘，避免把处理流水线拖慢。写输出视频时逐帧全画、不节流。
