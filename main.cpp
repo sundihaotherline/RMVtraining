@@ -975,6 +975,10 @@ void *OperationFunction(void *arg) {
             WEB_LOG("ekf_center_x_m", predictions.front().center_x_m);
             WEB_LOG("ekf_center_y_m", predictions.front().center_y_m);
             WEB_LOG("ekf_radius_m", predictions.front().radius_1_m);
+            // 原始 EKF yaw/ω（直接读预测结果，不被 logPrediction 的 NoTarget 清零）：
+            // 用于区分「EKF ω 真卡 0」还是「板丢 >0.2s 导致网页把结果整条打成 0」。
+            WEB_LOG("ekf_yaw_rad_raw", predictions.front().body_yaw);
+            WEB_LOG("ekf_yaw_rate_raw_rad_s", predictions.front().body_yaw_velocity);
         }
         const PredictionResult primary = selectPrimary(predictions);
         bool prediction_valid = applyPrediction(translator, primary);

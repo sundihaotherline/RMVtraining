@@ -207,13 +207,27 @@ std::vector<ArmorDetector::LightBar> ArmorDetector::extractLightBars(
         // 处，即为真实灯条边界，剪掉外侧 bloom。按每根灯条自身峰值取相对阈值，
         // 避免绝对阈值误伤较暗的远端灯条；用亮度而非颜色差，避免过曝白核被误裁。
         if (!strength.empty()) {
+            // 双线性插值采样：亮度剖面在亚像素 t 上平滑，端点定位不再被 lround 量化到
+            // 整数像素。原实现 t 整数步进 + lround，端点被量化到 ~1px，是角点→PnP→EKF
+            // 的高频抖动主源。
             const auto sample = [&](float t) -> float {
-                const int px = static_cast<int>(std::lround(x0 + t * vx));
-                const int py = static_cast<int>(std::lround(y0 + t * vy));
-                if (px < 0 || py < 0 || px >= strength.cols || py >= strength.rows) {
+                const float px = x0 + t * vx;
+                const float py = y0 + t * vy;
+                if (px < 0.0F || py < 0.0F || px >= strength.cols - 1.0F ||
+                    py >= strength.rows - 1.0F) {
                     return 0.0F;
                 }
-                return static_cast<float>(strength.at<uchar>(py, px));
+                const int xi = static_cast<int>(px);
+                const int yi = static_cast<int>(py);
+                const float fx = px - static_cast<float>(xi);
+                const float fy = py - static_cast<float>(yi);
+                const float v00 = static_cast<float>(strength.at<uchar>(yi, xi));
+                const float v01 = static_cast<float>(strength.at<uchar>(yi, xi + 1));
+                const float v10 = static_cast<float>(strength.at<uchar>(yi + 1, xi));
+                const float v11 = static_cast<float>(strength.at<uchar>(yi + 1, xi + 1));
+                const float top = v00 + (v01 - v00) * fx;
+                const float bot = v10 + (v11 - v10) * fx;
+                return top + (bot - top) * fy;
             };
 
             float peak = 0.0F;
@@ -223,19 +237,27 @@ std::vector<ArmorDetector::LightBar> ArmorDetector::extractLightBars(
             if (peak > 1.0F) {
                 const float cutoff = peak * static_cast<float>(kBarTrimStrengthRatio);
 
+                // 阈值跨越点做线性插值取亚像素：先整数步进找到跨越区间，再用区间两端
+                // 亮度线性内插出 cutoff 对应的精确 t，端点不再吸附到整数像素。
                 float t_top = t_min;
                 for (float t = t_min; t <= 0.0F; t += 1.0F) {
-                    if (sample(t) >= cutoff) {
-                        t_top = t;
+                    const float s1 = sample(t);
+                    if (s1 >= cutoff) {
+                        const float s0 = sample(t - 1.0F);
+                        t_top = s0 < cutoff ? (t - 1.0F) + (cutoff - s0) / (s1 - s0) : t;
                         break;
                     }
+                    t_top = t;
                 }
                 float t_bottom = t_max;
                 for (float t = t_max; t >= 0.0F; t -= 1.0F) {
-                    if (sample(t) >= cutoff) {
-                        t_bottom = t;
+                    const float s1 = sample(t);
+                    if (s1 >= cutoff) {
+                        const float s0 = sample(t + 1.0F);
+                        t_bottom = s0 < cutoff ? t + (s1 - cutoff) / (s1 - s0) : t;
                         break;
                     }
+                    t_bottom = t;
                 }
                 t_min = t_top;
                 t_max = t_bottom;

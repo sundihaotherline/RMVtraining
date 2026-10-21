@@ -41,6 +41,14 @@ constexpr double kQRadius  = 1e-5;   // (m²)     半径（认为基本不变）
 constexpr double kQYaw     = 1e-4;   // (rad²/s) yaw 过程噪声：θ 有位置+yaw 双观测锚定，噪声给小
 constexpr double kQYawRate = 1e-2;   // (rad/s)²/s yaw 角速度过程噪声：现在有 ω 直接观测（朝向差分）锚定，可放大让 ω 快速跟上转速变化
 constexpr double kRPosition = 1e-3;   // (m²)     观测位置噪声（约 3 cm 量级）
+// 自适应位置观测噪声（见 positionMeasurementNoise()）：R 不再固定 kRPosition，而是按
+// 观测质量缩放。重投影误差直接反映 4 角点拟合质量（角点→PnP 噪声的完整代理）；深度
+// 平方放大像素噪声（σ∝z²）。坏角点/远目标的观测被放大噪声降权，不再带飞 EKF；
+// 好观测噪声收紧、收敛更快。噪声作用在 gimbal 系三轴（旋转保持长度，量级不随外参变）。
+constexpr double kReprojNoiseGain = 0.15;   // R ∝ (1 + gain·reproj_px²)：6px 时 ≈6.4x
+constexpr double kRefDepthM = 2.0;          // 参考深度（m）：位置 R 按 (z/z_ref)² 缩放
+constexpr double kDepthNoiseFloor = 0.25;   // 深度缩放下限（近处不再缩，避免过度自信）
+constexpr double kDepthNoiseCeil = 16.0;    // 深度缩放上限（远处不再放大，避免彻底无视观测）
 constexpr double kRYawObs = 2e-2;     // (rad²)   yaw 直接观测噪声基准（板朝向，侧对时约 8°）
 constexpr double kYawSlantGain = 100.0;  // 板正对相机时 PnP 绕法向旋转病态，yaw/ω 观测噪声按 |cos(法向-视线)|² 放大
 constexpr double kRWObs = 4.0;        // (rad/s)² ω 直接观测噪声基准（侧对、30fps 时朝向差分+EMA 后约 σ≈2 rad/s）
@@ -75,7 +83,9 @@ constexpr double kRadiusPriorNoiseM = 0.06;         // 平移/静止车半径弱
 // |增量|>门限判换板丢弃，总扫角/总时长 = ω）。仅旋转车注入。
 constexpr std::size_t kOmegaWindow = 166;          // 前板朝向窗（帧）≈1s，覆盖整圈
 constexpr std::size_t kOmegaMinSamples = 40;       // 至少这么多有效增量才注入
-constexpr double kOmegaIncGateRad = 0.5;           // 相邻帧扫角增量门限（>28°判换板/离群，丢弃）
+constexpr double kOmegaIncGateRad = 0.15;          // 相邻帧扫角增量门限（>8.6°判换板/离群/正对乱跳，丢弃）
+                                                    // 0.5→0.15：0.5 会放过正对相机时十几度的小幅乱跳，
+                                                    // 让 ω 被错误方向的增量带负；真实每帧增量仅 ~0.015 rad。
 constexpr double kOmegaObsNoiseRadS = 1.0;         // 朝向窗 ω 观测噪声（rad/s），整圈累计后 σ≈1~2
 
 // 平移/静止判定门限：|ω| 低于此值（约 23°/s）视为纯平移/静止。此时单板位置对
@@ -267,8 +277,22 @@ Eigen::MatrixXd RotatingVehicleTracker::processNoise(double dt) const {
 }
 
 Eigen::MatrixXd RotatingVehicleTracker::measurementNoise() const {
+    // position update 的观测噪声：读当前观测的 active_* 成员（step() 更新前设置）。
+    return positionMeasurementNoise(active_reproj_error_, active_depth_m_);
+}
+
+Eigen::MatrixXd RotatingVehicleTracker::positionMeasurementNoise(double reproj_px,
+                                                                double depth_m) const {
+    // 位置观测噪声自适应缩放：重投影误差直接反映 4 角点拟合质量（角点→PnP 噪声的
+    // 完整代理），深度平方放大像素噪声（近大远小 σ∝z²）。坏角点/远目标的观测被放大
+    // 噪声降权，不再带飞 EKF；好观测噪声收紧、收敛更快。
+    const double reproj_scale = 1.0 + kReprojNoiseGain * reproj_px * reproj_px;
+    const double depth_scale =
+        depth_m > 0.0 ? std::clamp((depth_m * depth_m) / (kRefDepthM * kRefDepthM),
+                                   kDepthNoiseFloor, kDepthNoiseCeil)
+                      : 1.0;
     Eigen::MatrixXd R = Eigen::MatrixXd::Zero(3, 3);
-    R(0, 0) = R(1, 1) = R(2, 2) = kRPosition;
+    R(0, 0) = R(1, 1) = R(2, 2) = kRPosition * reproj_scale * depth_scale;
     return R;
 }
 
@@ -367,15 +391,20 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
         const Eigen::VectorXd& x_pri = ekf_->get_nochange_X_pri();
         const Eigen::MatrixXd& P_pri = ekf_->get_P_pri();
         // 观测对某槽位的马氏距离平方（基于同一先验，保证全局关联的一致性）。
-        auto maha2 = [&](const cv::Vec3d& p, int slot) -> double {
+        // 噪声按该观测自身的重投影误差/深度自适应缩放：坏角点的位置残差会被更大的 R
+        // 吸收、不至于被误判成离群点拒收；真正的误关联（槽位错配，残差≈2r）远大于
+        // 噪声量级，仍被门限拒掉。
+        auto maha2 = [&](const ArmorPose& obs, int slot) -> double {
             const Eigen::VectorXd zp = observationModel(x_pri, slot);
             Eigen::VectorXd z(3);
-            z(0) = p[0];
-            z(1) = p[1];
-            z(2) = p[2];
+            z(0) = obs.position_gimbal_m[0];
+            z(1) = obs.position_gimbal_m[1];
+            z(2) = obs.position_gimbal_m[2];
             const Eigen::VectorXd nu = z - zp;
             const Eigen::MatrixXd H = observationJacobian(x_pri, slot);
-            const Eigen::MatrixXd S = H * P_pri * H.transpose() + measurementNoise();
+            const Eigen::MatrixXd R = positionMeasurementNoise(obs.reprojection_error,
+                                                               obs.position_camera_m[2]);
+            const Eigen::MatrixXd S = H * P_pri * H.transpose() + R;
             return nu.transpose() * S.inverse() * nu;
         };
 
@@ -410,7 +439,7 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
             for (int i : order) {
                 const int s = prefer[i];
                 if (s < 0 || s >= 4 || slotUsed[s]) continue;
-                if (maha2(cands[i]->position_gimbal_m, s) <= kOutlierGate) {
+                if (maha2(*cands[i], s) <= kOutlierGate) {
                     slotOf[i] = s;
                     slotUsed[s] = true;
                 }
@@ -427,7 +456,7 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
                 std::vector<double>(remSlot.size(), std::numeric_limits<double>::infinity()));
             for (std::size_t i = 0; i < remObs.size(); ++i) {
                 for (std::size_t s = 0; s < remSlot.size(); ++s) {
-                    const double d2 = maha2(cands[remObs[i]]->position_gimbal_m, remSlot[s]);
+                    const double d2 = maha2(*cands[remObs[i]], remSlot[s]);
                     if (d2 <= kOutlierGate) cost[i][s] = d2;
                 }
             }
@@ -469,6 +498,10 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
             z(1) = p[1];
             z(2) = p[2];
             active_slot_ = slot;
+            // 自适应 R：把本观测的重投影误差/相机深度写进成员，measurementNoise() 据此
+            // 缩放位置观测噪声（update(z) 内部经 update_R 回调读取）。
+            active_reproj_error_ = obs.reprojection_error;
+            active_depth_m_ = obs.position_camera_m[2];
             ekf_->update(z);
             ekf_->usePostAsPri();  // 多观测时按后验继续下一个更新
             ++used;
@@ -523,13 +556,14 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
                 if (has_prev_meas_yaw_ && timestamp_seconds > prev_meas_time_) {
                     const double dt_m = timestamp_seconds - prev_meas_time_;
                     const double d = wrapToPi(yaw_proxy - prev_meas_yaw_);
-                    // 门限 0.5 rad：丢弃 ±π 翻转与换板跳变（换板使 yaw_proxy 跳 π/2）；
+                    // 门限 kOmegaIncGateRad（0.15 rad）：丢弃 ±π 翻转/换板跳变（π/2）与
+                    // 正对相机时朝向的小幅乱跳（十几度会掺进错误方向、把 ω 带负）；
                     // dt_m 下限 kMinMeasDtS 挡时间戳抖动的差分爆炸，上限 kMaxDtS 丢弃
                     // 遮挡盲区后的陈旧差分；瞬时 ω 再限幅兜底。
                     // 平移/静止时朝向病态，ω 差分观测同样不可靠，跳过注入（prev 时序仍滚动，
                     // 转起来后立即可差分）。
                     if (!translation_mode_ && dt_m >= kMinMeasDtS &&
-                        dt_m <= kMaxDtS && std::fabs(d) < 0.5) {
+                        dt_m <= kMaxDtS && std::fabs(d) < kOmegaIncGateRad) {
                         const double w_inst =
                             std::clamp(d / dt_m, -kMaxMeasWInst, kMaxMeasWInst);
                         meas_omega_rad_s_ = 0.3 * w_inst + 0.7 * meas_omega_rad_s_;
@@ -646,21 +680,24 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
                 recent_front_pos_.pop_front();
             }
 
-            double total_ang = 0.0, total_dt = 0.0;
-            int cnt = 0;
+            // 用有效增量的瞬时 ω（dth/dt）中位数替代 total_ang/total_dt 均值：均值对
+            // 正对相机时朝向的小幅乱跳敏感（乱跳增量符号会反、幅度达十几度，掺进和里
+            // 把 ω 拉负）；中位数由多数同号增量决定，天然鲁棒，配合收紧后的门限双保险。
+            std::vector<double> rates;
+            rates.reserve(recent_front_pos_.size());
             for (std::size_t i = 1; i < recent_front_pos_.size(); ++i) {
                 const auto& a = recent_front_pos_[i - 1];
                 const auto& b = recent_front_pos_[i];
                 const double dt = b[1] - a[1];
                 if (!(dt > 0.0) || dt > kMaxDtS) continue;       // 时间戳倒退/停顿
                 const double dth = wrapToPi(b[0] - a[0]);
-                if (std::fabs(dth) > kOmegaIncGateRad) continue;  // 换板/离群（>28°）
-                total_ang += dth;
-                total_dt += dt;
-                ++cnt;
+                if (std::fabs(dth) > kOmegaIncGateRad) continue;  // 换板/离群/正对乱跳
+                rates.push_back(dth / dt);
             }
-            if (cnt >= kOmegaMinSamples && total_dt > 0.0) {
-                const double w_fit = total_ang / total_dt;
+            if (rates.size() >= kOmegaMinSamples) {
+                std::nth_element(rates.begin(), rates.begin() + rates.size() / 2,
+                                 rates.end());
+                const double w_fit = rates[rates.size() / 2];
                 Eigen::MatrixXd H_w = Eigen::MatrixXd::Zero(1, kStateDim);
                 H_w(0, kYawRate) = 1.0;
                 Eigen::MatrixXd R_w = Eigen::MatrixXd::Zero(1, 1);

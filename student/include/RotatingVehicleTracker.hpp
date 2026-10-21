@@ -56,6 +56,8 @@ private:
     Eigen::MatrixXd observationJacobian(const Eigen::VectorXd& x, int slot) const;
     Eigen::MatrixXd processNoise(double dt) const;
     Eigen::MatrixXd measurementNoise() const;
+    // 位置观测噪声（3x3，gimbal 系）：按重投影误差与相机深度自适应缩放（见 .cpp）。
+    Eigen::MatrixXd positionMeasurementNoise(double reproj_px, double depth_m) const;
 
     // 数字(1~9) -> 槽位(0..3)；未知返回 -1，走全局最近邻关联。
     int numberToSlot(int target_id) const;
@@ -69,6 +71,8 @@ private:
 
     std::unique_ptr<class ExtendedKalmanFilter> ekf_;
     int active_slot_ = 0;   // 当前 update() 使用的槽位（h/jacobian_h 的 lambda 读它）
+    double active_reproj_error_{0.0};  // 当前 position update 观测的重投影误差（像素），供自适应 R 读
+    double active_depth_m_{0.0};       // 当前 position update 观测的相机深度（米），供自适应 R 读
     double dt_ = 0.0;       // 当前帧间隔，predict()/Q 的 lambda 读它
 
     bool initialized_ = false;
