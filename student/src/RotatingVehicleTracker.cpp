@@ -16,7 +16,7 @@ constexpr double kPi = 3.14159265358979323846;
 // ---------------------------------------------------------------------------
 // 调参区：这是本骨架最需要你按现场数据调整的量。
 // ---------------------------------------------------------------------------
-constexpr double kRadiusPriorM = 0.20;      // 半径先验（标准步兵约 0.2 m）
+constexpr double kRadiusPriorM = 0.27;      // 半径先验（实测装甲板到小车中心 27cm，非标准步兵 0.2m）
 constexpr double kMinRadiusM = 0.03;        // 半径下界：半径物理上必须为正
 constexpr double kMaxRadiusM = 0.60;        // 半径上界：防御发散（放宽，不硬锚定先验）
 constexpr double kBulletSpeedMps = 23.5;    // 子弹初速（m/s），报告写清来源
@@ -27,7 +27,7 @@ constexpr double kHoldLostSeconds = 0.2;    // 连续无观测超过此值 -> �
 // 旋转车体的装甲板会周期性转到背面被遮挡，两板之间的观测盲区可达 1s 量级；
 // 0.5s 会在盲区里反复重置、把 ω 重新归零，导致角速度永远拟合不出来，故放宽到
 // 1.5s，让 EKF 在盲区里做纯预测、保留已收敛的 ω。
-constexpr double kOutlierGate = 9.0;        // 3 自由度卡方 95% 分位约 7.8，放宽到 9
+constexpr double kOutlierGate = 15.0;        // 3 自由度卡方 95% 分位约 7.8，放宽到 9
 constexpr double kMaxMeasuredLatencyS = 1.0; // 处理延迟上限：超过即认为时间基准不一致（离线视频），按 0 处理
 constexpr double kFireYawErrorRad = 0.10;   // 开火 yaw 误差门限（约 5.7°）
 constexpr double kFireMinDistanceM = 0.5;
@@ -38,8 +38,10 @@ constexpr double kQPosition = 1e-3;   // (m²)     位置
 constexpr double kQVelocity = 1e-2;   // (m/s)²   速度
 constexpr double kQHeight  = 1e-4;   // (m²)     高度
 constexpr double kQRadius  = 1e-5;   // (m²)     半径（认为基本不变）
-constexpr double kQYaw     = 1e-4;   // (rad²/s) yaw 过程噪声：θ 有位置+yaw 双观测锚定，噪声给小
-constexpr double kQYawRate = 1e-2;   // (rad/s)²/s yaw 角速度过程噪声：现在有 ω 直接观测（朝向差分）锚定，可放大让 ω 快速跟上转速变化
+constexpr double kQYaw     = 1e-2;   // (rad²/s) yaw 过程噪声：θ 有位置+yaw 双观测锚定，噪声给小
+constexpr double kQYawRate = 2e-1;   // (rad/s)²/s yaw 角速度过程噪声：有 ω 直接观测（位置扫角）锚定，放大让 ω 快速跟上转速变化。
+                                                    // 8e-2 时 EKF ω 低通截止 ~0.6Hz，把 2s 周期正弦再压 ~0.7x；提到 2e-1 截止 ~0.9Hz、
+                                                    // 正弦衰减降到 ~0.87x（配合 0.5s 扫角窗一起把正弦幅度从 ~0.45x 恢复到 ~0.78x）。
 constexpr double kRPosition = 1e-3;   // (m²)     观测位置噪声（约 3 cm 量级）
 // 自适应位置观测噪声（见 positionMeasurementNoise()）：R 不再固定 kRPosition，而是按
 // 观测质量缩放。重投影误差直接反映 4 角点拟合质量（角点→PnP 噪声的完整代理）；深度
@@ -76,17 +78,17 @@ constexpr double kRadiusHintMaxCenterVel = 0.5;     // 中心速度低于此值�
 constexpr double kRadiusHintNoiseM = 0.02;          // 半径软观测噪声（m），比位置观测紧，压过塌缩方向
 constexpr double kRadiusPriorNoiseM = 0.06;         // 平移/静止车半径弱先验噪声（m）：先验 0.2 只是猜测，放宽不硬锁定
 
-// 朝向窗 ω 软观测（见 step() 的 (g) 段）：板只在正对相机时被检测到（slant≈1），被检测
-// 板的位置几乎恒在正前方、不绕中心扫角（实测位置角 std≈10°），朝向差分的 ω 观测又几乎
-// 恒被 slant 加权降到 0，ω 只能靠位置→θ 间接耦合估计、噪声大且随转速周期性振荡。改用
-// 「前板朝向 -armor_orientation_yaw 的 wrap 增量」窗口累计（逐帧 wrapToPi 增量，
-// |增量|>门限判换板丢弃，总扫角/总时长 = ω）。仅旋转车注入。
-constexpr std::size_t kOmegaWindow = 166;          // 前板朝向窗（帧）≈1s，覆盖整圈
-constexpr std::size_t kOmegaMinSamples = 40;       // 至少这么多有效增量才注入
-constexpr double kOmegaIncGateRad = 0.15;          // 相邻帧扫角增量门限（>8.6°判换板/离群/正对乱跳，丢弃）
-                                                    // 0.5→0.15：0.5 会放过正对相机时十几度的小幅乱跳，
-                                                    // 让 ω 被错误方向的增量带负；真实每帧增量仅 ~0.015 rad。
-constexpr double kOmegaObsNoiseRadS = 1.0;         // 朝向窗 ω 观测噪声（rad/s），整圈累计后 σ≈1~2
+// 位置扫角 ω 软观测（见 step() 的 (g) 段）：板只在正对相机时被检测到，其位置绕 EKF
+// 中心的方位角 θ_p = atan2(z-cz, x-cx) 随车体旋转单调扫（切向速度 = r·ω）。用「前板
+// 位置 θ_p 的 wrap 增量」窗口累计（逐帧 wrapToPi 增量，|增量|>门限判换板/离群丢弃，
+// 总扫角/总时长 = ω）。位置比法向朝向干净，且中心偏移对 θ_p 速率只造成二阶调制。
+constexpr std::size_t kOmegaWindow = 83;           // 前板位置窗（帧）≈0.5s。原 166≈1s 对 2s 周期正弦
+                                                    // 是滑动平均：幅度被 sinc(πT/2) 压到 ~0.64x，波峰够不到
+                                                    // 高速、波谷下不到低速。缩短到 0.5s 把衰减降到 ~0.90x。
+constexpr std::size_t kOmegaMinSamples = 20;       // 至少这么多有效增量才注入（窗缩短后按比例下调）
+constexpr double kOmegaIncGateRad = 0.15;          // 相邻帧 θ_p 增量门限（>8.6°判换板/离群，丢弃）；
+                                                    // 换板时 θ_p 跳 ~90°，远大于门限，被丢弃
+constexpr double kOmegaObsNoiseRadS = 1.0;         // 位置扫角 ω 观测噪声（rad/s），整圈累计后 σ≈1~2
 
 // 平移/静止判定门限：|ω| 低于此值（约 23°/s）视为纯平移/静止。此时单板位置对
 // yaw 几何不可观测（中心自由时任意 yaw 都能配出零残差），朝向观测又因板正对相机
@@ -150,6 +152,56 @@ int slotFromOrientation(double armor_orientation_yaw, double theta_prior) {
     slot %= 4;
     if (slot < 0) slot += 4;
     return slot;
+}
+
+// 固定半径的圆心拟合：给定半径 r（物理先验 kRadiusPriorM，见下），只解圆心 (cx,cz)。
+// 前板位置窗只覆盖正对相机的前弧（v1/v4 的 armor_position_yaw 实测仅 ~32°），半径从这
+// 段正面弧数据里几何不可观测——弧矢高 ~r·δ²/2 ≈ 8mm，小于 PnP 位置噪声 ~3cm，自由半径
+// 的 Kasa 圆拟合会把圆心往弧内拉、半径低估到 ~0.25r，绕错圆心算扫速就放大 ~1.5x（用户
+// 实测 ω 偏大的根因）。故半径钉到物理先验，只解圆心；径向位置被钉在离弧 r 处，窄弧也
+// 良态。Gauss-Newton 解 2 参数最小二乘 min Σ(‖p_i-C‖ - r)²，初始圆心取点云质心沿「远离
+// 相机」方向推 r（相机在原点，前弧在相机前方），4 轮收敛（径向良态；切向弱可观测但
+// 切向偏移只引入二阶调制、不影响扫速标度）。
+bool fitCenterFixedRadius(const std::deque<std::array<double, 3>>& pts,
+                          double r, double& cx, double& cz) {
+    const std::size_t n = pts.size();
+    if (n < 3 || !(r > kMinRadiusM && r < kMaxRadiusM)) return false;
+
+    double mx = 0.0, mz = 0.0;
+    for (const auto& p : pts) {
+        mx += p[0];
+        mz += p[1];
+    }
+    mx /= static_cast<double>(n);
+    mz /= static_cast<double>(n);
+    const double d0 = std::hypot(mx, mz);
+    if (d0 < 1e-6) return false;
+    cx = mx * (1.0 + r / d0);
+    cz = mz * (1.0 + r / d0);
+
+    for (int iter = 0; iter < 4; ++iter) {
+        double Sxx = 0.0, Sxz = 0.0, Szz = 0.0, gx = 0.0, gz = 0.0;
+        for (const auto& p : pts) {
+            const double dx = p[0] - cx, dz = p[1] - cz;
+            const double d = std::hypot(dx, dz);
+            if (d < 1e-6) continue;
+            const double jx = -dx / d, jz = -dz / d;  // ∂(‖p-C‖-r)/∂C
+            const double e = d - r;
+            Sxx += jx * jx;
+            Sxz += jx * jz;
+            Szz += jz * jz;
+            gx += jx * e;
+            gz += jz * e;
+        }
+        const double det = Sxx * Szz - Sxz * Sxz;
+        if (std::fabs(det) < 1e-9) break;
+        const double dxc = (-gx * Szz + Sxz * gz) / det;
+        const double dzc = (-Sxx * gz + gx * Sxz) / det;
+        cx += dxc;
+        cz += dzc;
+        if (std::hypot(dxc, dzc) < 1e-4) break;
+    }
+    return std::isfinite(cx) && std::isfinite(cz);
 }
 
 }  // namespace
@@ -657,47 +709,71 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
             }
         }
 
-#if 1  // 【已修复】启用 (g) ω 直接观测：改用「前板朝向扫角」而非位置扫角。
-        // (g) 朝向窗 ω 软观测：板只在正对相机时被检测到（slant≈1），被检测板的位置几乎
-        // 恒在正前方（位置角 std≈10°、不绕中心扫角），真正单调扫的是板的朝向
-        // armor_orientation_yaw（可见弧内扫 ~105°）。故用朝向的 wrap 增量窗口累计：
-        // 逐帧 wrapToPi 增量，|增量|>门限判换板/离群丢弃，总扫角/总时长即干净的 ω。
+#if 1  // 启用 (g) ω 直接观测：板位置绕中心扫角（切向速度 = r·ω）。
+        // (g) 位置扫角 ω 软观测：板只在正对相机时被检测到，被检测板（前板）的位置几乎
+        // 恒在正前方，但其绕旋转中心的方位角 θ_p = atan2(z-cz, x-cx) 随车体旋转单调扫
+        // （前板只在正对相机的窄弧内可见，实测 v1/v4 armor_position_yaw 仅 ~32°；相邻板
+        // 换板时 θ_p 跳 ~90°，被门限丢弃）。用前板位置 θ_p 的 wrap 增量窗口累计：逐帧
+        // wrapToPi 增量，|增量|>门限判换板/离群丢弃，总扫角/总时长即干净的 ω（切向速度
+        // = r·ω，扫速本身与 r 无关、只取决于圆心）。位置比法向朝向干净（PnP 位置条件数好）。
+        // 圆心用「固定半径」拟合（见 fitCenterFixedRadius），与 EKF 中心解耦。
         // 不再用 translation_mode_ 门控：它会造死锁——初始化 ω=0 → |ω|<0.4 → translation_mode_=true
-        // → (g) 被跳过 → ω 永远 0，旋转车永远转不起来（正是「EKF ω 卡 0、实测 ω 读 290」）。
-        // w_fit 本身自门：静止/平移车朝向不扫、w_fit≈0（正确注入 0），旋转车朝向扫、
-        // w_fit≈真 ω（把 ω 拉起）。平移车边平移时朝向会随视线方位缓慢变化、可能注入小假 ω，
-        // 属已知代价，后续用 |V| 或扫角幅值门限单独处理。
+        // → (g) 被跳过 → ω 永远 0，旋转车永远转不起来。w_fit 本身自门：静止/平移车
+        // 位置不扫、w_fit≈0（正确注入 0），旋转车位置扫、w_fit≈真 ω（把 ω 拉起）。
         {
             if (!observations.empty()) {
-                // -armor_orientation_yaw 作车体 yaw 代理（与 (e) 段 yaw_proxy 同约定）：
-                // armor_orientation_yaw = -(θ+φ+π/2)，取负后按 +ω 方向单调扫。
-                const double ori = -observations.front().armor_orientation_yaw;
-                if (std::isfinite(ori)) {
-                    recent_front_pos_.push_back({ori, timestamp_seconds, 0.0});
+                const cv::Vec3d& p = observations.front().position_gimbal_m;
+                if (std::isfinite(p[0]) && std::isfinite(p[2])) {
+                    recent_front_pos_.push_back({p[0], p[2], timestamp_seconds});
                 }
             }
             while (recent_front_pos_.size() > kOmegaWindow) {
                 recent_front_pos_.pop_front();
             }
 
-            // 用有效增量的瞬时 ω（dth/dt）中位数替代 total_ang/total_dt 均值：均值对
-            // 正对相机时朝向的小幅乱跳敏感（乱跳增量符号会反、幅度达十几度，掺进和里
-            // 把 ω 拉负）；中位数由多数同号增量决定，天然鲁棒，配合收紧后的门限双保险。
-            std::vector<double> rates;
-            rates.reserve(recent_front_pos_.size());
+            // 累计：逐段 wrapToPi 增量累加，总扫角/总时长 = ω。圆心用固定半径拟合还原的
+            // 真实圆心，而非 EKF 中心：EKF 半径塌缩时中心 (cx,cz) 会被钉到板位置附近，
+            // 用错中心算 θ_p 扫速会在板掠过中心时放大好几倍（4→13 rad/s 的根因）。
+            double cx = ekf_->get_X()(kCx);
+            double cz = ekf_->get_X()(kCz);
+            // 圆心用「固定半径」拟合：前板位置窗只覆盖正对相机的前弧（v1/v4 实测 ~32°），
+            // 半径从这段正面弧几何不可观测（弧矢高 ~8mm < 位置噪声 ~3cm），自由半径圆拟合
+            // 会把圆心往弧内拉、半径低估 -> 绕错圆心算扫速放大（ω 偏大 ~1.5x 根因）。故半径
+            // 钉到物理先验 kRadiusPriorM，只解圆心（径向良态），扫速标度即正确。拟合失败
+            // （样本不足/退化）退回 EKF 中心（自由半径圆拟合同样受窄弧偏差污染，不作回退）。
+            double cfit_r = kRadiusPriorM;
+            if (!fitCenterFixedRadius(recent_front_pos_, kRadiusPriorM, cx, cz)) {
+                cfit_r = ekf_->get_X()(kR);
+            }
+            double total_sweep = 0.0;
+            double total_dt = 0.0;
+            int valid_steps = 0;
             for (std::size_t i = 1; i < recent_front_pos_.size(); ++i) {
                 const auto& a = recent_front_pos_[i - 1];
                 const auto& b = recent_front_pos_[i];
-                const double dt = b[1] - a[1];
+                const double dt = b[2] - a[2];
                 if (!(dt > 0.0) || dt > kMaxDtS) continue;       // 时间戳倒退/停顿
-                const double dth = wrapToPi(b[0] - a[0]);
-                if (std::fabs(dth) > kOmegaIncGateRad) continue;  // 换板/离群/正对乱跳
-                rates.push_back(dth / dt);
+                const double th_a = std::atan2(a[1] - cz, a[0] - cx);
+                const double th_b = std::atan2(b[1] - cz, b[0] - cx);
+                const double dth = wrapToPi(th_b - th_a);
+                if (std::fabs(dth) > kOmegaIncGateRad) continue;  // 换板（~90°）/离群
+                total_sweep += dth;
+                total_dt += dt;
+                ++valid_steps;
             }
-            if (rates.size() >= kOmegaMinSamples) {
-                std::nth_element(rates.begin(), rates.begin() + rates.size() / 2,
-                                 rates.end());
-                const double w_fit = rates[rates.size() / 2];
+            if (valid_steps >= kOmegaMinSamples && total_dt > 0.0) {
+                // [临时诊断] 打印扫角窗的 unwrap 扫角、固定半径拟合圆心/半径 vs EKF 中心/半径。
+                if (std::getenv("RMV_DUMP_OMEGA")) {
+                    std::fprintf(stderr,
+                        "[OMEGA] n=%zu sweep=%.1fdeg fit_c=(%.3f,%.3f) fit_r=%.3f "
+                        "ekf_c=(%.3f,%.3f) ekf_r=%.3f w_fit=%.3f\n",
+                        recent_front_pos_.size(), total_sweep * 180.0 / kPi,
+                        cx, cz, cfit_r,
+                        ekf_->get_X()(kCx), ekf_->get_X()(kCz), ekf_->get_X()(kR),
+                        total_sweep / total_dt);
+                }
+                const double w_fit = std::clamp(total_sweep / total_dt,
+                                                -kMaxMeasWInst, kMaxMeasWInst);
                 Eigen::MatrixXd H_w = Eigen::MatrixXd::Zero(1, kStateDim);
                 H_w(0, kYawRate) = 1.0;
                 Eigen::MatrixXd R_w = Eigen::MatrixXd::Zero(1, 1);
@@ -708,7 +784,7 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
                 ekf_->usePostAsPri();
             }
         }
-#endif  // (g) ω 直接观测结束（朝向窗扫角软观测）
+#endif  // (g) ω 直接观测结束（位置扫角软观测）
 
     }
 

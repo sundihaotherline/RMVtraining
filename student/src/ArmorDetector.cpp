@@ -23,7 +23,15 @@ constexpr int kBlueHueHigh = 124;
 // 正对较远的灯条直接滤掉，导致可测角度窗口过窄。放低这两项以扩大可测角度
 // （样本更多 -> ω 收敛更快），代价是更容易误检，靠后面的配对 + PnP 重投影兜底。
 constexpr int kColorSaturationMin = 55;
-constexpr int kColorValueMin = 20;
+// V（亮度）阈值：正对相机时 LED 最亮（核心 V 饱和到 255），其 bloom 沿**横向**（垂直
+// 灯条主轴）拖出一圈蓝色光晕——光晕保持蓝色（S≥55、B−R≥20 都过，是散射的蓝光不是白
+// 光），只有 V 从核心 255 沿横向平滑衰减到 ~42。V=20/40 都会把这圈横向光晕收进来，
+// 把两根竖直灯条各自横向撑胖：实测 1440x1080 正对帧，左灯条横向宽到 124px（长宽比
+// 0.75）、右灯条 62px（长宽比 1.40），都 < kMinAspectRatio(1.5) 被拒 → 正对一根都检不出。
+// 纵向 bloom 已有主轴裁剪（kBarTrimStrengthRatio）处理，横向没有，只能靠 V 阈值压。
+// V≥70 两根才彻底分开，V=80 时左长宽比 3.15、右 1.77（余量足）。旋转车前板只在 ±16°
+// 内被检、LED 亮度始终 >200，不受影响；若还要检大角度侧对板（LED 更暗）可回调到 30。
+constexpr int kColorValueMin = 80;
 // ---- BGR 通道差掩膜阈值 ----
 constexpr int kChannelDiffMin = 20;
 

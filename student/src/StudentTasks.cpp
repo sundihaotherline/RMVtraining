@@ -48,8 +48,8 @@ ArmorDetector& sharedDetector() {
         const bool loaded = classifier.load(datasetDirectory());
         detector.setClassifier(loaded ? &classifier : nullptr);
         std::cerr << "[数字分类] "
-                  << (loaded ? "模板加载成功"
-                             : "模板加载失败：datasets 目录缺失或 1..9 类别不全，贴纸数字将不显示")
+                  << (loaded ? "ONNX 模型加载成功 (datasets/digit_cnn.onnx)"
+                             : "ONNX 模型加载失败：缺少 datasets/digit_cnn.onnx，贴纸数字将不显示")
                   << '\n';
     }
     return detector;

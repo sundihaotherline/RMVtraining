@@ -105,10 +105,11 @@ private:
     // RMS 离质心距离直接观测半径（整圈时 RMS≈r），把半径锚回真值（见 step() 的 (f) 段）。
     std::deque<std::array<double, 2>> recent_pos_;
 
-    // 朝向窗 ω 软观测的最近「前板」朝向窗（(ori, t, unused)，rad/s）：板只在正对相机时
-    // 被检测到（slant≈1），被检测板的位置几乎恒在正前方、不绕中心扫角，改用前板朝向
-    // -armor_orientation_yaw 的 wrap 增量窗口累计估计 ω（见 step() 的 (g) 段）。与
-    // recent_pos_ 分开：这里只收 observations.front() 的朝向，且带时间戳。
+    // 位置扫角 ω 软观测的最近「前板」位置窗（(x, z, t)，m）：板只在正对相机时被检测到，
+    // 用前板位置绕旋转中心的方位角 θ_p = atan2(z-cz, x-cx) 的 wrap 增量窗口累计估计 ω
+    // （切向速度 = r·ω，见 step() 的 (g) 段）。圆心由本窗做「圆拟合」还原（EKF 半径塌缩
+    // 会把中心钉到板附近，错中心让扫速放大好几倍，故不直接用 EKF 中心）。与
+    // recent_pos_ 分开：这里只收 observations.front() 的位置，且带时间戳。
     std::deque<std::array<double, 3>> recent_front_pos_;
 
     // 平移/静止模式：|ω| 低于阈值时 yaw 从单板位置几何不可观测（中心自由时任意

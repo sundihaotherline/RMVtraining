@@ -1,9 +1,9 @@
 #pragma once
 
 #include <string>
-#include <vector>
 
 #include <opencv2/core.hpp>
+#include <opencv2/dnn.hpp>
 
 // 装甲板中央图案分类器。
 //
@@ -13,15 +13,15 @@
 //   6outpost/7guard/8base -> 前哨站/哨兵/基地（非装甲板目标）
 //   9neg   -> 负样本
 //
-// 运行时按目录读取样本并计算每类平均模板，再用归一化互相关与待分类 ROI
-// 比较。置信度为归一化后的相关系数，范围 [0, 1]。
+// 轻量 CNN 分类器（tools/train_digit_cnn.py 训练，ONNX 导出），由 OpenCV cv::dnn
+// 推理。相比原「平均模板 + matchTemplate」，对 live ROI 的尺度/光照/角度域差更鲁棒。
+// 置信度为 softmax 概率，范围 [0, 1]。
 class NumberClassifier {
 public:
     static constexpr int kWidth = 20;
     static constexpr int kHeight = 28;
 
-    // 从 dataset_dir 加载样本。该目录应包含 1,2,3,4,5,6outpost,7guard,8base,
-    // 9neg 九个子目录。全部加载成功返回 true。
+    // 从 dataset_dir 加载 ONNX 模型（dataset_dir/digit_cnn.onnx）。加载成功返回 true。
     bool load(const std::string& dataset_dir);
 
     bool loaded() const { return loaded_; }
@@ -35,6 +35,7 @@ private:
     static cv::Mat preprocess(const cv::Mat& roi);
 
     bool loaded_{false};
-    // 索引 0..8 依次对应类别 1..9 的平均模板（CV_32F，kWidth x kHeight）。
-    std::vector<cv::Mat> templates_;
+    // cv::dnn::Net::setInput/forward 非 const（会改内部状态），classify 是 const 方法，
+    // 故标记 mutable。
+    mutable cv::dnn::Net net_;
 };

@@ -2,14 +2,17 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
+#include <limits>
+#include <vector>
 
-#include <opencv2/imgcodecs.hpp>
+#include <opencv2/dnn.hpp>
 #include <opencv2/imgproc.hpp>
 
 namespace {
 
-// 类别目录名，按类别编号 1..9 排列。
+// 类别目录名，按类别编号 1..9 排列（仅用于文档/对照，CNN 输出 9 类即对应 1..9）。
 const std::array<const char*, 9> kClassDirs = {
     "1", "2", "3", "4", "5", "6outpost", "7guard", "8base", "9neg",
 };
@@ -31,8 +34,8 @@ cv::Mat NumberClassifier::preprocess(const cv::Mat& roi) {
     cv::threshold(gray, binary, 0, 255,
                   cv::THRESH_BINARY | cv::THRESH_OTSU);
 
-    // 只保留亮像素的包围盒并居中，再缩放到模板尺寸。模板与待分类图都走同一套
-    // 处理，消除数字在 ROI 内位置/大小不同造成的误分类（这是“只有 2 能被认出”的主因）。
+    // 只保留亮像素的包围盒并居中，再缩放到网络输入尺寸。与训练脚本
+    // tools/train_digit_cnn.py 的 preprocess() 保持一致，保证训练/推理域对齐。
     std::vector<cv::Point> foreground;
     cv::findNonZero(binary, foreground);
     if (foreground.empty()) {
@@ -59,47 +62,18 @@ cv::Mat NumberClassifier::preprocess(const cv::Mat& roi) {
 }
 
 bool NumberClassifier::load(const std::string& dataset_dir) {
-    templates_.clear();
+    net_ = cv::dnn::Net();
     loaded_ = false;
 
-    // 逐类读取全部样本，累加得到平均模板。
-    for (int cls = 0; cls < static_cast<int>(kClassDirs.size()); ++cls) {
-        std::vector<cv::String> files;
-        try {
-            cv::glob(dataset_dir + "/" + kClassDirs[cls] + "/*.*", files, false);
-        } catch (const cv::Exception&) {
-            // 目录不存在时 cv::glob 会抛异常，按空目录处理。
-            files.clear();
-        }
-        if (files.empty()) {
-            continue;
-        }
-
-        cv::Mat sum = cv::Mat::zeros(kHeight, kWidth, CV_64F);
-        std::size_t count = 0;
-        for (const cv::String& file : files) {
-            cv::Mat sample = cv::imread(file, cv::IMREAD_GRAYSCALE);
-            if (sample.empty()) {
-                continue;
-            }
-            // 与 classify 使用同一套预处理（阈值 + 居中 + 缩放），保证模板与查询对齐。
-            cv::Mat normalized;
-            preprocess(sample).convertTo(normalized, CV_64F);
-            sum += normalized;
-            ++count;
-        }
-
-        if (count == 0) {
-            continue;
-        }
-
-        cv::Mat mean;
-        sum.convertTo(mean, CV_32F, 1.0 / static_cast<double>(count));
-        templates_.push_back(mean);
+    // 轻量 CNN 分类器：由 tools/train_digit_cnn.py 训练并导出为 ONNX（9 类，含负样本）。
+    const std::string model_path = dataset_dir + "/digit_cnn.onnx";
+    try {
+        net_ = cv::dnn::readNetFromONNX(model_path);
+    } catch (const cv::Exception&) {
+        net_ = cv::dnn::Net();
     }
 
-    // 需要九个类别都加载成功才算就绪。
-    loaded_ = templates_.size() == kClassDirs.size();
+    loaded_ = !net_.empty();
     return loaded_;
 }
 
@@ -110,21 +84,32 @@ int NumberClassifier::classify(const cv::Mat& roi, float& confidence) const {
     }
 
     const cv::Mat query = preprocess(roi);
-    int best_class = 0;
-    double best_score = -1.0;
 
-    for (std::size_t cls = 0; cls < templates_.size(); ++cls) {
-        // 模板与查询同尺寸，TM_CCOEFF_NORMED 会输出单一相关值。
-        cv::Mat result;
-        cv::matchTemplate(query, templates_[cls], result, cv::TM_CCOEFF_NORMED);
-        const double score = result.at<float>(0, 0);
-        if (score > best_score) {
-            best_score = score;
-            best_class = static_cast<int>(cls) + 1;
+    // NCHW 输入：[1, 1, kHeight, kWidth]。query 已是 kHeight x kWidth 单通道 CV_32F。
+    cv::Mat blob = cv::dnn::blobFromImage(query, 1.0, cv::Size(kWidth, kHeight),
+                                          cv::Scalar(), false, false);
+    net_.setInput(blob);
+    const cv::Mat out = net_.forward();  // shape (1, 9) logits
+
+    const float* logits = out.ptr<float>(0);
+    double max_logit = -std::numeric_limits<double>::infinity();
+    for (int i = 0; i < 9; ++i) {
+        max_logit = std::max(max_logit, static_cast<double>(logits[i]));
+    }
+    double probs[9];
+    double sum = 0.0;
+    for (int i = 0; i < 9; ++i) {
+        probs[i] = std::exp(static_cast<double>(logits[i]) - max_logit);
+        sum += probs[i];
+    }
+    int best = 0;
+    for (int i = 0; i < 9; ++i) {
+        probs[i] /= sum;
+        if (probs[i] > probs[best]) {
+            best = i;
         }
     }
 
-    // 相关系数范围 [-1, 1]，映射到 [0, 1]。
-    confidence = static_cast<float>(std::max(0.0, (best_score + 1.0) / 2.0));
-    return best_class;
+    confidence = static_cast<float>(probs[best]);
+    return best + 1;  // 1..9
 }

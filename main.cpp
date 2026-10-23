@@ -215,6 +215,10 @@ bool writeFrame(SerialPort& serialPort, Translator& frame) {
 void logPrediction(const PredictionResult& result) {
     WEB_LOG("target_found", result.state == TrackingState::NoTarget ? 0.0 : 1.0);
     WEB_LOG("ekf_state", static_cast<double>(result.state));
+    // 开火状态（0/1）：EKF 给出的开火许可（稳定 + yaw 误差小 + 距离在射程内）。
+    // 与串口发往 MCU 的 fire_allowance 一致——NoTarget 时 logPrediction 收到的
+    // 是默认全 0 结果，自然输出 0。
+    WEB_LOG("fire_allowed", result.fire_allowed ? 1.0 : 0.0);
     // 始终输出全部字段：NoTarget 时 result 为默认全 0，仍会打出 0 值。这样网页端
     // 每张曲线卡自程序启动就存在，不会因为目标未锁上（NoTarget）而整张卡消失。
     WEB_LOG("target_id", result.target_id);
@@ -287,12 +291,12 @@ void drawEkfOverlay(cv::Mat& vis, const std::vector<PredictionResult>& preds,
         // 每车一行状态文字（画在俯视图上方）。
         char text[320];
         std::snprintf(text, sizeof(text),
-                      "car%d plate=%d slot=%d c=(%.2f,%.2f) v=(%.2f,%.2f) yaw=%.0f w=%.0f r=%.2f",
+                      "car%d plate=%d slot=%d c=(%.2f,%.2f) v=(%.2f,%.2f) yaw=%.0f w=%.0f r=%.2f fire=%d",
                       car, static_cast<int>(p.tracked_id), static_cast<int>(p.tracked_slot),
                       p.center_x_m, p.center_y_m,
                       p.center_velocity_x_m_s, p.center_velocity_y_m_s,
                       p.body_yaw * 180.0 / CV_PI, p.body_yaw_velocity * 180.0 / CV_PI,
-                      p.radius_1_m);
+                      p.radius_1_m, p.fire_allowed ? 1 : 0);
         cv::putText(vis, text,
                     cv::Point(static_cast<int>(o.x - box / 2.0F),
                               static_cast<int>(o.y - box / 2.0F - 8.0F)),
@@ -761,10 +765,10 @@ void *OperationFunction(void *arg) {
         }
         WEB_LOG("meas_yaw_rate_rad_s", meas_w_display);
 
-        // [离线调试] 实时框选可视化，ESC 退出。按 ~30fps 节流刷新窗口，
-        // 其余帧跳过 imshow/重绘，避免把处理流水线拖慢。写输出视频时逐帧全画、不节流。
+        // [调试] 实时框选可视化（离线与实车串口模式均显示），ESC 退出。按 ~30fps
+        // 节流刷新窗口，其余帧跳过 imshow/重绘，避免把处理流水线拖慢。写输出视频时逐帧全画、不节流。
         const bool writing_output = !out_video_path.empty();
-        if (!serial_connected && !pic.empty() &&
+        if (!pic.empty() &&
             (writing_output ||
              std::chrono::steady_clock::now() - last_viz_time >=
                  std::chrono::milliseconds(33))) {
@@ -892,6 +896,24 @@ void *OperationFunction(void *arg) {
                           enemy_color == TeamColor::Red ? "red" : "blue");
             cv::putText(vis, status, cv::Point(12, 30), cv::FONT_HERSHEY_SIMPLEX,
                         0.8, cv::Scalar(0, 255, 0), 2);
+            // 开火状态：主目标是否允许开火（Stable 且 fire_allowed，与发往 MCU 的
+            // fire_allowance 同义）。绿=允许开火、红=禁止开火，顶部居中一眼可见。
+            {
+                const PredictionResult fire_primary = selectPrimary(g_last_predictions);
+                const bool fire_state = fire_primary.state == TrackingState::Stable &&
+                                        fire_primary.fire_allowed;
+                const std::string fire_text = fire_state ? "FIRE" : "NO FIRE";
+                const cv::Scalar fire_color =
+                    fire_state ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255);
+                int fire_baseline = 0;
+                const cv::Size fire_size =
+                    cv::getTextSize(fire_text, cv::FONT_HERSHEY_SIMPLEX, 1.3, 3,
+                                    &fire_baseline);
+                cv::putText(vis, fire_text,
+                            cv::Point((vis.cols - fire_size.width) / 2,
+                                      fire_size.height + 12),
+                            cv::FONT_HERSHEY_SIMPLEX, 1.3, fire_color, 3);
+            }
             // PnP 诊断：对首个检测框逐项显示每道拒绝门槛的通过情况与数值。
             if (!detections.empty()) {
                 const PnPDiagnostic diag = armor_solve_debug(detections.front(), camera);

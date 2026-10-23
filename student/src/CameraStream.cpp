@@ -124,7 +124,7 @@ bool CameraStream::openMvs() {
     // 因此关闭增益并把曝光固定到 4000us。
     MV_CC_SetEnumValue(handle, "TriggerMode", 0);
     MV_CC_SetEnumValue(handle, "ExposureAuto", 0);              // 0 = Off
-    MV_CC_SetFloatValue(handle, "ExposureTime", 6000.0F);
+    MV_CC_SetFloatValue(handle, "ExposureTime", 4000.0F);
     MV_CC_SetEnumValue(handle, "GainAuto", 0);                  // 0 = Off
     MV_CC_SetFloatValue(handle, "Gain", 0.0F);
     MV_CC_SetEnumValue(handle, "PixelFormat", PixelType_Gvsp_BayerRG8);
