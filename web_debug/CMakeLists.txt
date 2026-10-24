@@ -19,6 +19,5 @@ target_include_directories(web_debug
 )
 target_compile_definitions(web_debug
     PUBLIC WEB_DEBUG
-    PRIVATE WEB_DEBUG_STATIC_DIR="${CMAKE_CURRENT_SOURCE_DIR}/static"
 )
 target_link_libraries(web_debug PUBLIC Threads::Threads)

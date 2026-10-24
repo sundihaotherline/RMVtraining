@@ -972,6 +972,12 @@ void *OperationFunction(void *arg) {
                     display = vis;
                 }
                 cv::imshow("armor debug", display);
+                // 数字区调试图：左=灰度 ROI、右=OTSU 二值，一眼核对透视校正（角点顺序）
+                // 与阈值是否正确。仅在已分类过（图非空）时弹出。
+                const cv::Mat& digit_dbg = armor_digit_debug();
+                if (!digit_dbg.empty()) {
+                    cv::imshow("digit binary", digit_dbg);
+                }
                 if (cv::waitKey(1) == 27) {
                     shutdown_requested.store(true, std::memory_order_relaxed);
                 }

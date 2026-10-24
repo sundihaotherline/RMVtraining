@@ -51,6 +51,9 @@ public:
     // 最近一次 detect() 的配对诊断（见 PairDiagnostic），供可视化读取。
     const PairDiagnostic& lastPairDiagnostic() const { return last_pair_diag_; }
 
+    // 最近一次 classifyCenter() 的数字区调试图（灰度+二值），供可视化读取。
+    const cv::Mat& lastDigitDebug() const { return digit_debug_; }
+
 private:
     cv::Mat buildMask(const cv::Mat& bgr, TeamColor enemy_color) const;
     // 亮度图（V = max(R,G,B)），供灯条端点晕光裁剪。过曝灯条核心发白，
@@ -76,4 +79,9 @@ private:
     std::vector<LightBar> last_bars_;
     // 最近一次 detect() 的配对诊断缓存，供可视化读取（见 lastPairDiagnostic()）。
     PairDiagnostic last_pair_diag_;
+
+    // 最近一次 classifyCenter() 的数字区调试图（左=classify 的 query 20x28 二值图放大，
+    // 右=OTSU 二值图，放大后拼接），供可视化直接验证透视校正（角点顺序）、中央裁区
+    // 是否避开灯条 bloom、以及拿去和模板比互相关的那张图是否正确，避免再跑一遍预处理。
+    mutable cv::Mat digit_debug_;
 };

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <vector>
 
@@ -324,6 +326,24 @@ bool ArmorDetector::buildDetection(const LightBar& left, const LightBar& right,
     return true;
 }
 
+namespace {
+// 中央数字区裁剪（占 warp 后板矩形的比例）。数字贴纸居中，灯条在板两侧；亮环境下
+// 灯条横向 bloom 向内渗，旧 22%~78% 的横向裁区会把 bloom 一起收进来盖住数字。横向
+// 裁区收窄到 30%~70%（单数字仍完整），给 bloom 留出 ~10% 余量。
+constexpr double kDigitRoiX0 = 0.30;
+constexpr double kDigitRoiX1 = 0.70;
+// 竖直裁区：数字贴纸比灯条高（上下都超出灯条端点），warp 时在竖直方向上下各外扩
+// kDigitWarpPadY 倍的灯条高，让完整贴纸落进 warp 图，故竖直裁区取满高（横向裁区已
+// 避开两侧灯条/bloom，竖直方向无需再收）。
+constexpr double kDigitRoiY0 = 0.0;
+constexpr double kDigitRoiY1 = 1.0;
+// warp 竖直方向上下各外扩的比例（相对灯条高）。数字贴纸上下超出灯条端点约 0.3~0.4
+// 倍灯条高，取 0.5 留余量；外扩只用于数字分类的 warp，PnP 仍用原始角点。
+constexpr double kDigitWarpPadY = 0.5;
+// 数字区调试窗口的放大倍数，便于肉眼检查 query 与 OTSU 二值图。
+constexpr double kDigitDebugScale = 6.0;
+}  // namespace
+
 bool ArmorDetector::classifyCenter(const cv::Mat& bgr, ArmorDetection& detection) const {
     if (classifier_ == nullptr || !classifier_->loaded()) {
         return false;
@@ -337,27 +357,110 @@ bool ArmorDetector::classifyCenter(const cv::Mat& bgr, ArmorDetection& detection
     const int warp_w = std::max(1, static_cast<int>(std::max(top_width, bottom_width)));
     const int warp_h = std::max(1, static_cast<int>(std::max(left_height, right_height)));
 
+    // 数字贴纸比灯条高：角点取自灯条端点，直接 warp 会把贴纸上下切掉（v4 实测「3」
+    // 上下各被切 ~25px，缺了上/下横杠的「3」被认成「4」）。故竖直方向上下各外扩一段，
+    // 让贴纸完整落进 warp 图，灯条端点映射到图内的中段。外扩只影响数字分类，PnP
+    // 仍用原始 detection.corners，不受影响。
+    const int pad_y = std::max(1, static_cast<int>(warp_h * kDigitWarpPadY));
+    const int full_h = warp_h + 2 * pad_y;
+
     const std::array<cv::Point2f, 4> src = {detection.corners[0], detection.corners[1],
                                             detection.corners[2], detection.corners[3]};
     const std::array<cv::Point2f, 4> dst = {
-        cv::Point2f(0.0F, 0.0F), cv::Point2f(static_cast<float>(warp_w - 1), 0.0F),
-        cv::Point2f(static_cast<float>(warp_w - 1), static_cast<float>(warp_h - 1)),
-        cv::Point2f(0.0F, static_cast<float>(warp_h - 1))};
+        cv::Point2f(0.0F, static_cast<float>(pad_y)),
+        cv::Point2f(static_cast<float>(warp_w - 1), static_cast<float>(pad_y)),
+        cv::Point2f(static_cast<float>(warp_w - 1), static_cast<float>(pad_y + warp_h - 1)),
+        cv::Point2f(0.0F, static_cast<float>(pad_y + warp_h - 1))};
 
     const cv::Mat transform = cv::getPerspectiveTransform(src.data(), dst.data());
     cv::Mat warped;
-    cv::warpPerspective(bgr, warped, transform, cv::Size(warp_w, warp_h));
+    cv::warpPerspective(bgr, warped, transform, cv::Size(warp_w, full_h));
 
-    // 数字占据装甲板中央区域。
-    const cv::Rect roi(static_cast<int>(warp_w * 0.22), static_cast<int>(warp_h * 0.12),
-                       static_cast<int>(warp_w * 0.56), static_cast<int>(warp_h * 0.76));
+    // 数字贴纸占据装甲板中央。横向裁区收窄，避开两侧灯条的横向 bloom（亮环境下
+    // 会向内渗、盖住数字）。
+    const cv::Rect roi(static_cast<int>(warp_w * kDigitRoiX0),
+                       static_cast<int>(full_h * kDigitRoiY0),
+                       static_cast<int>(warp_w * (kDigitRoiX1 - kDigitRoiX0)),
+                       static_cast<int>(full_h * (kDigitRoiY1 - kDigitRoiY0)));
     if (roi.x < 0 || roi.y < 0 || roi.x + roi.width > warp_w ||
-        roi.y + roi.height > warp_h) {
+        roi.y + roi.height > full_h) {
         return false;
     }
 
+    // 单帧分类：直接对 warp 后的中央 ROI 分类（与原始 v1.0.0 一致），不再做时域累积。
+    // 时域累积会把旋转板的数字在窗口内抹成糊团，多车时还共用全局累积器混掉不同车的
+    // 数字，反而把本来干净的 query 糊掉、稳定塌缩到「4」。是否可信只交给模板置信度。
     float confidence = 0.0F;
     const int number = classifier_->classify(warped(roi), confidence);
+
+    // 组装数字区调试图：左=classify 的 query（bbox 裁剪后的 20x28 二值图放大，即拿去
+    // 和模板比互相关的那张图）、右=OTSU 二值（bbox 裁剪前、ROI 原生分辨率）。顶部标注
+    // 匹配结果/置信度，便于一眼定位「没出数字」是匹配不到，还是置信度被门槛拦掉。
+    {
+        const cv::Mat& query = classifier_->lastQuery();
+        const cv::Mat& binary = classifier_->lastBinary();
+
+        const int panel_h = 168;  // 统一到固定高度便于并排
+        cv::Mat left, right;
+        if (!query.empty()) {
+            cv::Mat q8;
+            query.convertTo(q8, CV_8U, 255.0);  // [0,1] -> [0,255]
+            cv::Mat q_big;
+            cv::resize(q8, q_big, cv::Size(), kDigitDebugScale, kDigitDebugScale,
+                       cv::INTER_NEAREST);
+            cv::resize(q_big, left,
+                       cv::Size(std::max(1, q_big.cols * panel_h / q_big.rows), panel_h),
+                       0, 0, cv::INTER_NEAREST);
+        }
+        if (!binary.empty()) {
+            cv::Mat b_big;
+            cv::resize(binary, b_big, cv::Size(), kDigitDebugScale, kDigitDebugScale,
+                       cv::INTER_NEAREST);
+            cv::resize(b_big, right,
+                       cv::Size(std::max(1, b_big.cols * panel_h / b_big.rows), panel_h),
+                       0, 0, cv::INTER_NEAREST);
+        }
+
+        cv::Mat side;
+        if (!left.empty() && !right.empty()) {
+            cv::Mat l3, r3;
+            cv::cvtColor(left, l3, cv::COLOR_GRAY2BGR);
+            cv::cvtColor(right, r3, cv::COLOR_GRAY2BGR);
+            cv::hconcat(l3, r3, side);
+        } else if (!left.empty()) {
+            cv::cvtColor(left, side, cv::COLOR_GRAY2BGR);
+        } else if (!right.empty()) {
+            cv::cvtColor(right, side, cv::COLOR_GRAY2BGR);
+        } else {
+            side = cv::Mat::zeros(panel_h, 320, CV_8UC3);
+        }
+
+        const bool accepted = number >= 1 && number <= 9 &&
+                              confidence >= kMinNumberConfidence;
+        const int banner = 48;
+        cv::Mat canvas(side.rows + banner, side.cols, side.type(), cv::Scalar(0, 0, 0));
+        side.copyTo(canvas(cv::Rect(0, banner, side.cols, side.rows)));
+        char line[160];
+        std::snprintf(line, sizeof(line), "cls=%d conf=%.2f (thr=%.2f) %s",
+                      number, static_cast<double>(confidence),
+                      static_cast<double>(kMinNumberConfidence),
+                      accepted ? "-> OK" : "-> reject(low conf)");
+        cv::putText(canvas, line, cv::Point(6, 20), cv::FONT_HERSHEY_SIMPLEX, 0.55,
+                    accepted ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 0, 255), 1);
+        // 9 类互相关得分（映射到 [0,1]）：一眼看出正确类是否紧咬第一、是否整体偏低
+        // （无信息）、还是某错误类稳定第一（形状/裁区问题）。
+        char pline[256];
+        int off = std::snprintf(pline, sizeof(pline), "P:");
+        const auto& probs = classifier_->lastProbs();
+        for (int i = 0; i < 9 && off < static_cast<int>(sizeof(pline)) - 9; ++i) {
+            off += std::snprintf(pline + off, sizeof(pline) - off, " %d:%.2f", i + 1,
+                                 static_cast<double>(probs[i]));
+        }
+        cv::putText(canvas, pline, cv::Point(6, 42), cv::FONT_HERSHEY_SIMPLEX, 0.45,
+                    cv::Scalar(180, 180, 180), 1);
+        digit_debug_ = canvas;
+    }
+
     // 有效编号扩到 1..9：1..5 是装甲板，6/7/8/9 是前哨/哨兵/基地/负样本，
     // 都作为已识别目标如实填写编号；只有未识别或低置信度才返回 false。
     if (number < 1 || number > 9 || confidence < kMinNumberConfidence) {

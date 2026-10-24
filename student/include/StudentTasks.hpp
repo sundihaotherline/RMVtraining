@@ -36,6 +36,9 @@ std::vector<ArmorDetector::LightBar> armor_detect_debug(const cv::Mat& pic,
 // 调试：返回上一帧配对诊断（最宽灯条对的几何量与是否被拒），定位「框丢失」断点。
 ArmorDetector::PairDiagnostic armor_pair_diagnostic();
 
+// 调试：返回最近一次数字分类的调试图（灰度 ROI + OTSU 二值），验证透视校正与阈值。
+const cv::Mat& armor_digit_debug();
+
 // 任务 3：使用已标定的相机内参进行位姿解算，再将观测从相机坐标系变换到云台坐标系。
 // 输出位置单位为米。
 std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections,

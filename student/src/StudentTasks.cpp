@@ -48,8 +48,8 @@ ArmorDetector& sharedDetector() {
         const bool loaded = classifier.load(datasetDirectory());
         detector.setClassifier(loaded ? &classifier : nullptr);
         std::cerr << "[数字分类] "
-                  << (loaded ? "ONNX 模型加载成功 (datasets/digit_cnn.onnx)"
-                             : "ONNX 模型加载失败：缺少 datasets/digit_cnn.onnx，贴纸数字将不显示")
+                  << (loaded ? "平均模板加载成功 (datasets/1..9neg，共 9 类)"
+                             : "平均模板加载失败：datasets/ 下 1..9neg 目录不全，贴纸数字将不显示")
                   << '\n';
     }
     return detector;
@@ -153,6 +153,10 @@ std::vector<ArmorDetector::LightBar> armor_detect_debug(const cv::Mat&,
 
 ArmorDetector::PairDiagnostic armor_pair_diagnostic() {
     return sharedDetector().lastPairDiagnostic();
+}
+
+const cv::Mat& armor_digit_debug() {
+    return sharedDetector().lastDigitDebug();
 }
 
 std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections,

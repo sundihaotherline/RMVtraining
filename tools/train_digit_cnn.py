@@ -26,9 +26,13 @@ CLASS_DIRS = ["1", "2", "3", "4", "5", "6outpost", "7guard", "8base", "9neg"]
 
 
 def preprocess(gray: np.ndarray) -> np.ndarray:
-    """复刻 C++ NumberClassifier::preprocess：OTSU -> 前景 bbox -> pad -> resize。"""
+    """复刻 C++ NumberClassifier::preprocess：2/98% 分位拉伸 -> OTSU -> 前景 bbox -> pad -> resize。"""
     if gray.dtype != np.uint8:
         gray = gray.astype(np.uint8)
+    lo, hi = np.percentile(gray, 2), np.percentile(gray, 98)
+    if hi > lo:
+        gray = np.clip((gray.astype(np.float32) - lo) * (255.0 / (hi - lo)),
+                       0, 255).astype(np.uint8)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
     ys, xs = np.nonzero(binary)
     if len(xs) == 0:

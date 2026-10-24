@@ -2,24 +2,22 @@
 
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <cstddef>
-#include <limits>
 #include <vector>
 
-#include <opencv2/dnn.hpp>
+#include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 
 namespace {
 
-// 类别目录名，按类别编号 1..9 排列（仅用于文档/对照，CNN 输出 9 类即对应 1..9）。
+// 类别目录名，按类别编号 1..9 排列。
 const std::array<const char*, 9> kClassDirs = {
     "1", "2", "3", "4", "5", "6outpost", "7guard", "8base", "9neg",
 };
 
 }  // namespace
 
-cv::Mat NumberClassifier::preprocess(const cv::Mat& roi) {
+cv::Mat NumberClassifier::preprocess(const cv::Mat& roi, cv::Mat* binary_out) {
     cv::Mat gray;
     if (roi.channels() == 3) {
         cv::cvtColor(roi, gray, cv::COLOR_BGR2GRAY);
@@ -29,13 +27,31 @@ cv::Mat NumberClassifier::preprocess(const cv::Mat& roi) {
         gray = roi;
     }
 
-    // 数字是亮图案：先自适应阈值得到黑白图。
-    cv::Mat binary;
-    cv::threshold(gray, binary, 0, 255,
-                  cv::THRESH_BINARY | cv::THRESH_OTSU);
+    // 数字是亮图案：先自适应阈值得到黑白图。欠曝/低对比 ROI 里数字笔画与背景只差
+    // 几十灰阶，Otsu 双峰贴近时会把暗笔画（如 3 的上弯）一起抹掉；先按 2%/98%
+    // 分位拉伸到全范围再 Otsu，让双峰拉开。数据集图已是全范围，此步≈恒等。
+    cv::Mat equalized = gray.clone();
+    {
+        cv::Mat flat = gray.clone().reshape(1, 1);
+        cv::sort(flat, flat, cv::SORT_EVERY_ROW | cv::SORT_ASCENDING);
+        const int n = flat.cols;
+        const uchar lo = flat.at<uchar>(0, n * 2 / 100);
+        const uchar hi = flat.at<uchar>(0, std::min(n - 1, n * 98 / 100));
+        if (hi > lo) {
+            const double scale = 255.0 / static_cast<double>(hi - lo);
+            equalized.convertTo(equalized, CV_8U, scale, -static_cast<double>(lo) * scale);
+        }
+    }
 
-    // 只保留亮像素的包围盒并居中，再缩放到网络输入尺寸。与训练脚本
-    // tools/train_digit_cnn.py 的 preprocess() 保持一致，保证训练/推理域对齐。
+    cv::Mat binary;
+    cv::threshold(equalized, binary, 0, 255,
+                  cv::THRESH_BINARY | cv::THRESH_OTSU);
+    if (binary_out != nullptr) {
+        *binary_out = binary;
+    }
+
+    // 只保留亮像素的包围盒并居中，再缩放到 20x28：让数字居中、尺度归一，去掉位置/
+    // 尺度差异对互相关的影响。模板与 query 都走这一步，保证两边域对齐。
     std::vector<cv::Point> foreground;
     cv::findNonZero(binary, foreground);
     if (foreground.empty()) {
@@ -62,54 +78,82 @@ cv::Mat NumberClassifier::preprocess(const cv::Mat& roi) {
 }
 
 bool NumberClassifier::load(const std::string& dataset_dir) {
-    net_ = cv::dnn::Net();
+    templates_.clear();
     loaded_ = false;
 
-    // 轻量 CNN 分类器：由 tools/train_digit_cnn.py 训练并导出为 ONNX（9 类，含负样本）。
-    const std::string model_path = dataset_dir + "/digit_cnn.onnx";
-    try {
-        net_ = cv::dnn::readNetFromONNX(model_path);
-    } catch (const cv::Exception&) {
-        net_ = cv::dnn::Net();
+    // 逐类读取全部样本，用与 classify 完全相同的 preprocess 后累加求平均模板。
+    for (int cls = 0; cls < static_cast<int>(kClassDirs.size()); ++cls) {
+        std::vector<cv::String> files;
+        try {
+            cv::glob(dataset_dir + "/" + kClassDirs[cls] + "/*.*", files, false);
+        } catch (const cv::Exception&) {
+            // 目录不存在时 cv::glob 会抛异常，按空目录处理。
+            files.clear();
+        }
+        if (files.empty()) {
+            continue;
+        }
+
+        cv::Mat sum = cv::Mat::zeros(kHeight, kWidth, CV_64F);
+        std::size_t count = 0;
+        for (const cv::String& file : files) {
+            cv::Mat sample = cv::imread(file, cv::IMREAD_GRAYSCALE);
+            if (sample.empty()) {
+                continue;
+            }
+            const cv::Mat q = preprocess(sample);
+            if (cv::countNonZero(q) == 0) {
+                continue;  // 无前景的坏样本跳过，避免污染平均模板
+            }
+            cv::Mat d;
+            q.convertTo(d, CV_64F);
+            sum += d;
+            ++count;
+        }
+
+        if (count == 0) {
+            continue;
+        }
+
+        cv::Mat mean;
+        sum.convertTo(mean, CV_32F, 1.0 / static_cast<double>(count));
+        templates_.push_back(mean);
     }
 
-    loaded_ = !net_.empty();
+    // 需要九个类别都加载成功才算就绪。
+    loaded_ = templates_.size() == kClassDirs.size();
     return loaded_;
 }
 
 int NumberClassifier::classify(const cv::Mat& roi, float& confidence) const {
     confidence = 0.0F;
+    last_probs_.fill(0.0F);
     if (!loaded_ || roi.empty()) {
         return 0;
     }
 
-    const cv::Mat query = preprocess(roi);
-
-    // NCHW 输入：[1, 1, kHeight, kWidth]。query 已是 kHeight x kWidth 单通道 CV_32F。
-    cv::Mat blob = cv::dnn::blobFromImage(query, 1.0, cv::Size(kWidth, kHeight),
-                                          cv::Scalar(), false, false);
-    net_.setInput(blob);
-    const cv::Mat out = net_.forward();  // shape (1, 9) logits
-
-    const float* logits = out.ptr<float>(0);
-    double max_logit = -std::numeric_limits<double>::infinity();
-    for (int i = 0; i < 9; ++i) {
-        max_logit = std::max(max_logit, static_cast<double>(logits[i]));
+    const cv::Mat query = preprocess(roi, &last_binary_);
+    last_query_ = query;
+    if (cv::countNonZero(query) == 0) {
+        return 0;  // 无前景，无法匹配
     }
-    double probs[9];
-    double sum = 0.0;
-    for (int i = 0; i < 9; ++i) {
-        probs[i] = std::exp(static_cast<double>(logits[i]) - max_logit);
-        sum += probs[i];
-    }
-    int best = 0;
-    for (int i = 0; i < 9; ++i) {
-        probs[i] /= sum;
-        if (probs[i] > probs[best]) {
-            best = i;
+
+    int best_class = 0;
+    double best_score = -1.0;
+
+    for (std::size_t cls = 0; cls < templates_.size(); ++cls) {
+        // 模板与查询同尺寸，TM_CCOEFF_NORMED 会输出单一相关值。
+        cv::Mat result;
+        cv::matchTemplate(query, templates_[cls], result, cv::TM_CCOEFF_NORMED);
+        const double score = result.at<float>(0, 0);
+        last_probs_[cls] = static_cast<float>(std::max(0.0, (score + 1.0) / 2.0));
+        if (score > best_score) {
+            best_score = score;
+            best_class = static_cast<int>(cls) + 1;
         }
     }
 
-    confidence = static_cast<float>(probs[best]);
-    return best + 1;  // 1..9
+    // 相关系数范围 [-1, 1]，映射到 [0, 1]。
+    confidence = static_cast<float>(std::max(0.0, (best_score + 1.0) / 2.0));
+    return best_class;
 }

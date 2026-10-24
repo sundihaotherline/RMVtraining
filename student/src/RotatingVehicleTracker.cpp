@@ -71,6 +71,7 @@ constexpr double kVelDampOmega2Thresh = 6.25;  // ω² 阈值 = 2.5² rad/s
 // 做直接观测，防止 EKF 借单板弱可观测把半径拉塌。仅旋转车（|ω| 大）适用：平移车
 // 位置窗是平移轨迹、RMS 与半径无关，不注入。
 constexpr std::size_t kRadiusHintWindow = 166;      // 半径软观测滑动窗（帧）≈1s，覆盖整圈
+constexpr double kRadiusHintWindowSeconds = 1.0;    // 改为按时间裁剪：固定 1s，与帧率/检测率解耦
 constexpr std::size_t kRadiusHintMinSamples = 20;   // 至少这么多点才注入（避免初始弧段 RMS 低估）
 constexpr double kRadiusHintOmegaRadS = 1.5;        // |ω| 超过此值才注入（~86°/s，区分旋转/平移）
 constexpr double kRadiusHintMaxCenterVel = 0.5;     // 中心速度低于此值才视为「原地旋转」（哨兵），
@@ -83,6 +84,7 @@ constexpr double kRadiusPriorNoiseM = 0.06;         // 平移/静止车半径弱
 // 位置 θ_p 的 wrap 增量」窗口累计（逐帧 wrapToPi 增量，|增量|>门限判换板/离群丢弃，
 // 总扫角/总时长 = ω）。位置比法向朝向干净，且中心偏移对 θ_p 速率只造成二阶调制。
 constexpr std::size_t kOmegaWindow = 83;           // 前板位置窗（帧）≈0.5s。原 166≈1s 对 2s 周期正弦
+constexpr double kOmegaWindowSeconds = 0.5;        // 改为按时间裁剪：窗口固定 0.5s，与帧率/检测率解耦
                                                     // 是滑动平均：幅度被 sinc(πT/2) 压到 ~0.64x，波峰够不到
                                                     // 高速、波谷下不到低速。缩短到 0.5s 把衰减降到 ~0.90x。
 constexpr std::size_t kOmegaMinSamples = 20;       // 至少这么多有效增量才注入（窗缩短后按比例下调）
@@ -529,11 +531,12 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
                 slot_to_id_[s] = next_global_id_ ? (*next_global_id_)++
                                                  : next_appearance_id_++;
             }
-            // 记录该板的贴纸数字：首次识别到非零数字即存下（槽位是板的固定身份，
-            // 转一圈后沿用，与单帧丢失/遮挡无关）。
+            // 记录该板的贴纸数字：每次识别到非零数字都更新，不把槽位永久绑定到
+            // 首次读到的数字。数字识别受曝光/角度/运动模糊影响会偶发错判，转回来时
+            // 重新识别比冻结第一次结果更可靠；当前帧读成 0（未知）则保留上一次的值。
             const std::uint8_t digit =
                 static_cast<std::uint8_t>(cands[i]->detection.target_id);
-            if (digit > 0 && slot_to_digit_[s] == 0) {
+            if (digit > 0) {
                 slot_to_digit_[s] = digit;
             }
         }
@@ -653,10 +656,11 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
             for (const ArmorPose* c : cands) {
                 const cv::Vec3d& p = c->position_gimbal_m;
                 if (std::isfinite(p[0]) && std::isfinite(p[2])) {
-                    recent_pos_.push_back({p[0], p[2]});
+                    recent_pos_.push_back({p[0], p[2], timestamp_seconds});
                 }
             }
-            while (recent_pos_.size() > kRadiusHintWindow) {
+            while (recent_pos_.size() >= 2 &&
+                   timestamp_seconds - recent_pos_.front()[2] > kRadiusHintWindowSeconds) {
                 recent_pos_.pop_front();
             }
 
@@ -727,7 +731,8 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
                     recent_front_pos_.push_back({p[0], p[2], timestamp_seconds});
                 }
             }
-            while (recent_front_pos_.size() > kOmegaWindow) {
+            while (recent_front_pos_.size() >= 2 &&
+                   timestamp_seconds - recent_front_pos_.front()[2] > kOmegaWindowSeconds) {
                 recent_front_pos_.pop_front();
             }
 
@@ -748,6 +753,7 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
             double total_sweep = 0.0;
             double total_dt = 0.0;
             int valid_steps = 0;
+            int dropped_steps = 0;
             for (std::size_t i = 1; i < recent_front_pos_.size(); ++i) {
                 const auto& a = recent_front_pos_[i - 1];
                 const auto& b = recent_front_pos_[i];
@@ -756,7 +762,7 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
                 const double th_a = std::atan2(a[1] - cz, a[0] - cx);
                 const double th_b = std::atan2(b[1] - cz, b[0] - cx);
                 const double dth = wrapToPi(th_b - th_a);
-                if (std::fabs(dth) > kOmegaIncGateRad) continue;  // 换板（~90°）/离群
+                if (std::fabs(dth) > kOmegaIncGateRad) { ++dropped_steps; continue; }  // 换板（~90°）/离群
                 total_sweep += dth;
                 total_dt += dt;
                 ++valid_steps;
@@ -764,12 +770,13 @@ PredictionResult RotatingVehicleTracker::step(const std::vector<ArmorPose>& obse
             if (valid_steps >= kOmegaMinSamples && total_dt > 0.0) {
                 // [临时诊断] 打印扫角窗的 unwrap 扫角、固定半径拟合圆心/半径 vs EKF 中心/半径。
                 if (std::getenv("RMV_DUMP_OMEGA")) {
+                    const double t_span = recent_front_pos_.back()[2] - recent_front_pos_.front()[2];
                     std::fprintf(stderr,
-                        "[OMEGA] n=%zu sweep=%.1fdeg fit_c=(%.3f,%.3f) fit_r=%.3f "
-                        "ekf_c=(%.3f,%.3f) ekf_r=%.3f w_fit=%.3f\n",
-                        recent_front_pos_.size(), total_sweep * 180.0 / kPi,
-                        cx, cz, cfit_r,
-                        ekf_->get_X()(kCx), ekf_->get_X()(kCz), ekf_->get_X()(kR),
+                        "[OMEGA] n=%zu t_span=%.2fs sweep=%.1fdeg drop=%d valid=%d "
+                        "fit_c=(%.3f,%.3f) ekf_c=(%.3f,%.3f) w_fit=%.3f\n",
+                        recent_front_pos_.size(), t_span, total_sweep * 180.0 / kPi,
+                        dropped_steps, valid_steps,
+                        cx, cz, ekf_->get_X()(kCx), ekf_->get_X()(kCz),
                         total_sweep / total_dt);
                 }
                 const double w_fit = std::clamp(total_sweep / total_dt,
